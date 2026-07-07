@@ -1,0 +1,56 @@
+{
+    "enabled": true,
+
+    "provider": "discord",
+
+    "discord": {
+        "enabled": true,
+        "webhook_url": "",
+        "username": "TrendForge",
+        "avatar_url": "",
+        "timeout": 10
+    },
+
+    "filters": {
+        "minimum_score": 75,
+        "signals": [
+            "STRONG BUY",
+            "BUY"
+        ]
+    },
+
+    "cooldown": {
+        "enabled": true,
+        "minutes": 15
+    },
+
+    "scanner_alerts": {
+        "intraday": true,
+        "swing": true,
+        "breakout": true,
+        "positional": true,
+        "options": true
+    },
+
+    "priority": {
+        "technical": true,
+        "fundamental": true,
+        "corporate_action": true,
+        "news": true
+    },
+
+    "market_hours": {
+        "enabled": true,
+        "start": "09:15",
+        "end": "15:30"
+    },
+
+    "message": {
+        "include_score": true,
+        "include_reasons": true,
+        "include_price": true,
+        "include_targets": true,
+        "include_stoploss": true,
+        "include_timeframe": true
+    }
+}

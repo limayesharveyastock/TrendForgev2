@@ -1,0 +1,37 @@
+{
+    "EMA_ALIGNMENT": 10,
+    "EMA_GOLDEN_CROSS": 5,
+
+    "RSI": 8,
+    "MACD": 10,
+    "ADX": 8,
+
+    "RVOL": 10,
+    "VWAP": 5,
+    "CMF": 5,
+
+    "BREAKOUT": 12,
+    "ATR_EXPANSION": 5,
+    "BB_SQUEEZE": 5,
+
+    "ENGULFING": 5,
+    "HAMMER": 3,
+
+    "ROE": 8,
+    "ROCE": 8,
+    "PE": 6,
+    "DEBT": 8,
+    "SALES_GROWTH": 8,
+    "PROFIT_GROWTH": 8,
+    "PROMOTER": 6,
+
+    "EARNINGS": 4,
+    "BONUS": 3,
+    "DIVIDEND": 2,
+
+    "LONG_BUILDUP": 6,
+    "SHORT_COVERING": 6,
+
+    "HIGH_BETA": -5,
+    "LOW_LIQUIDITY": -8
+}
