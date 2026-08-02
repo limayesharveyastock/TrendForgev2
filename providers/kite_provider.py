@@ -21,6 +21,9 @@ import time
 from functools import wraps
 from typing import Dict, List, Optional, Any
 
+from abc import ABC
+import pandas as pd
+
 from kiteconnect import KiteConnect, KiteException
 
 from config.settings import settings
@@ -339,3 +342,47 @@ class KiteProvider:
 
 
 kite_provider = KiteProvider()
+
+class KiteProvider(ABC):
+
+    def __init__(self, kite):
+
+        self.kite = kite
+
+    def historical_data(
+
+        self,
+
+        instrument_token,
+
+        from_date,
+
+        to_date,
+
+        interval,
+
+    ):
+
+        data = self.kite.historical_data(
+
+            instrument_token,
+
+            from_date,
+
+            to_date,
+
+            interval,
+
+            oi=True,
+
+        )
+
+        return pd.DataFrame(data)
+
+    def ltp(self, instruments):
+
+        return self.kite.ltp(instruments)
+
+    def quote(self, instruments):
+
+        return self.kite.quote(instruments)

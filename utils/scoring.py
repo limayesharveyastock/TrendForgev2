@@ -28,3 +28,42 @@ def band_score(value, bands):
             return score
 
     return 0
+
+    class ScoreNormalizer:
+
+    @staticmethod
+    def normalize(
+
+        value,
+
+        minimum,
+
+        maximum,
+
+    ):
+
+        if maximum == minimum:
+
+            return 0
+
+        return (
+
+            (
+
+                value -
+
+                minimum
+
+            )
+
+            /
+
+            (
+
+                maximum -
+
+                minimum
+
+            )
+
+        ) * 100

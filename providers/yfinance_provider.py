@@ -429,3 +429,31 @@ class YahooFinanceProvider:
 
 # Singleton instance
 yfinance_provider = YahooFinanceProvider()
+
+class YahooFinanceProvider:
+
+    def candles(
+
+        self,
+
+        symbol,
+
+        period="6mo",
+
+        interval="1d",
+
+    ):
+
+        return yf.download(
+
+            symbol,
+
+            period=period,
+
+            interval=interval,
+
+            progress=False,
+
+            auto_adjust=False,
+
+        )

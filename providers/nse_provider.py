@@ -397,3 +397,33 @@ class NSEProvider:
 
 
 nse_provider = NSEProvider()
+
+class NSEProvider:
+
+    BASE = "https://www.nseindia.com/api"
+
+    def __init__(self):
+
+        self.session = requests.Session()
+
+    def market_status(self):
+
+        return self.session.get(
+
+            f"{self.BASE}/marketStatus"
+
+        ).json()
+
+    def quote(self, symbol):
+
+        return self.session.get(
+
+            f"{self.BASE}/quote-equity",
+
+            params={
+
+                "symbol": symbol
+
+            }
+
+        ).json()
