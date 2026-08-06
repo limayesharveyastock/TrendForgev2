@@ -1,585 +1,961 @@
 """
 TrendForge v2
 Scanner Rules Engine
+
+Purpose:
+    Convert indicator/fundamental data into deterministic boolean rules.
+
+Architecture:
+    Indicator Engine
+        ↓
+    ScannerRules
+        ↓
+    Scoring Engine
+        ↓
+    Signal Engine
+
+Rules are intentionally deterministic.
+No data fetching is performed here.
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 import pandas as pd
 
 
 class ScannerRules:
 
-    # =====================================================
+    # =========================================================
+    # SAFE HELPERS
+    # =========================================================
+
+    @staticmethod
+    def _get(
+        data: Any,
+        key: str,
+        default: Any = None,
+    ) -> Any:
+
+        if data is None:
+            return default
+
+        if isinstance(data, dict):
+            return data.get(key, default)
+
+        try:
+            return data.get(key, default)
+        except Exception:
+            pass
+
+        return getattr(
+            data,
+            key,
+            default,
+        )
+
+    @staticmethod
+    def _number(
+        data: Any,
+        key: str,
+        default: float = 0.0,
+    ) -> float:
+
+        value = ScannerRules._get(
+            data,
+            key,
+            default,
+        )
+
+        try:
+            if pd.isna(value):
+                return default
+
+            return float(value)
+
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _bool(
+        data: Any,
+        key: str,
+        default: bool = False,
+    ) -> bool:
+
+        value = ScannerRules._get(
+            data,
+            key,
+            default,
+        )
+
+        if pd.isna(value) if not isinstance(value, bool) else False:
+            return default
+
+        return bool(value)
+
+    # =========================================================
     # TREND
-    # =====================================================
+    # =========================================================
 
     @staticmethod
-    def ema_bullish(latest):
+    def ema_bullish(latest: Any) -> bool:
 
         return (
-            latest["EMA_20"] >
-            latest["EMA_50"] >
-            latest["EMA_200"]
+            ScannerRules._number(latest, "EMA_20")
+            >
+            ScannerRules._number(latest, "EMA_50")
+            >
+            ScannerRules._number(latest, "EMA_200")
         )
 
     @staticmethod
-    def ema_bearish(latest):
+    def ema_bearish(latest: Any) -> bool:
 
         return (
-            latest["EMA_20"] <
-            latest["EMA_50"] <
-            latest["EMA_200"]
+            ScannerRules._number(latest, "EMA_20")
+            <
+            ScannerRules._number(latest, "EMA_50")
+            <
+            ScannerRules._number(latest, "EMA_200")
         )
 
     @staticmethod
-    def golden_cross(latest):
+    def golden_cross(latest: Any) -> bool:
+
+        ema50 = ScannerRules._number(
+            latest,
+            "EMA_50",
+        )
+
+        ema200 = ScannerRules._number(
+            latest,
+            "EMA_200",
+        )
+
+        return ema50 > ema200
+
+    @staticmethod
+    def death_cross(latest: Any) -> bool:
+
+        ema50 = ScannerRules._number(
+            latest,
+            "EMA_50",
+        )
+
+        ema200 = ScannerRules._number(
+            latest,
+            "EMA_200",
+        )
+
+        return ema50 < ema200
+
+    @staticmethod
+    def ema9_above_26(latest: Any) -> bool:
 
         return (
-            latest["EMA_50"] >
-            latest["EMA_200"]
+            ScannerRules._number(latest, "EMA_9")
+            >
+            ScannerRules._number(latest, "EMA_26")
         )
 
     @staticmethod
-    def death_cross(latest):
+    def ema9_below_26(latest: Any) -> bool:
 
         return (
-            latest["EMA_50"] <
-            latest["EMA_200"]
+            ScannerRules._number(latest, "EMA_9")
+            <
+            ScannerRules._number(latest, "EMA_26")
         )
 
-    # =====================================================
+    @staticmethod
+    def vwma9_above_26(latest: Any) -> bool:
+
+        return (
+            ScannerRules._number(latest, "VWMA_9")
+            >
+            ScannerRules._number(latest, "VWMA_26")
+        )
+
+    @staticmethod
+    def vwma9_below_26(latest: Any) -> bool:
+
+        return (
+            ScannerRules._number(latest, "VWMA_9")
+            <
+            ScannerRules._number(latest, "VWMA_26")
+        )
+
+    # =========================================================
     # MOMENTUM
-    # =====================================================
+    # =========================================================
 
     @staticmethod
-    def rsi_bullish(latest):
+    def rsi_bullish(latest: Any) -> bool:
 
-        return 55 <= latest["RSI"] <= 70
+        rsi = ScannerRules._number(
+            latest,
+            "RSI",
+        )
 
-    @staticmethod
-    def rsi_oversold(latest):
-
-        return latest["RSI"] < 30
-
-    @staticmethod
-    def rsi_overbought(latest):
-
-        return latest["RSI"] > 70
+        return 55 <= rsi <= 70
 
     @staticmethod
-    def macd_bullish(latest):
+    def rsi_bearish(latest: Any) -> bool:
+
+        rsi = ScannerRules._number(
+            latest,
+            "RSI",
+        )
+
+        return 30 <= rsi <= 45
+
+    @staticmethod
+    def rsi_oversold(latest: Any) -> bool:
 
         return (
-            latest["MACD"] >
-            latest["MACD_SIGNAL"]
+            ScannerRules._number(
+                latest,
+                "RSI",
+            )
+            < 30
         )
 
     @staticmethod
-    def adx_strong(latest):
+    def rsi_overbought(latest: Any) -> bool:
 
-        return latest["ADX"] > 25
-
-    # =====================================================
-    # VOLUME
-    # =====================================================
-
-    @staticmethod
-    def high_volume(latest):
-
-        return latest["RVOL"] >= 2
+        return (
+            ScannerRules._number(
+                latest,
+                "RSI",
+            )
+            > 70
+        )
 
     @staticmethod
-    def medium_volume(latest):
+    def macd_bullish(latest: Any) -> bool:
 
-        return latest["RVOL"] >= 1.5
+        return (
+            ScannerRules._number(latest, "MACD")
+            >
+            ScannerRules._number(latest, "MACD_SIGNAL")
+        )
 
     @staticmethod
-    def positive_money_flow(latest):
+    def macd_bearish(latest: Any) -> bool:
 
-        return latest["CMF"] > 0
+        return (
+            ScannerRules._number(latest, "MACD")
+            <
+            ScannerRules._number(latest, "MACD_SIGNAL")
+        )
 
     @staticmethod
-    def above_vwap(latest):
+    def adx_strong(latest: Any) -> bool:
 
-        return latest["close"] > latest["VWAP"]
+        return (
+            ScannerRules._number(
+                latest,
+                "ADX",
+            )
+            > 25
+        )
 
-    # =====================================================
+    # =========================================================
+    # VOLUME / MONEY FLOW
+    # =========================================================
+
+    @staticmethod
+    def high_volume(latest: Any) -> bool:
+
+        return (
+            ScannerRules._number(
+                latest,
+                "RVOL",
+            )
+            >= 2
+        )
+
+    @staticmethod
+    def medium_volume(latest: Any) -> bool:
+
+        return (
+            ScannerRules._number(
+                latest,
+                "RVOL",
+            )
+            >= 1.5
+        )
+
+    @staticmethod
+    def low_volume(latest: Any) -> bool:
+
+        return (
+            ScannerRules._number(
+                latest,
+                "RVOL",
+            )
+            < 1
+        )
+
+    @staticmethod
+    def positive_money_flow(latest: Any) -> bool:
+
+        return (
+            ScannerRules._number(
+                latest,
+                "CMF",
+            )
+            > 0
+        )
+
+    @staticmethod
+    def negative_money_flow(latest: Any) -> bool:
+
+        return (
+            ScannerRules._number(
+                latest,
+                "CMF",
+            )
+            < 0
+        )
+
+    @staticmethod
+    def above_vwap(latest: Any) -> bool:
+
+        return (
+            ScannerRules._number(latest, "close")
+            >
+            ScannerRules._number(latest, "VWAP")
+        )
+
+    @staticmethod
+    def below_vwap(latest: Any) -> bool:
+
+        return (
+            ScannerRules._number(latest, "close")
+            <
+            ScannerRules._number(latest, "VWAP")
+        )
+
+    # =========================================================
     # VOLATILITY
-    # =====================================================
+    # =========================================================
 
     @staticmethod
-    def atr_expansion(latest):
+    def atr_expansion(latest: Any) -> bool:
 
-        return latest["ATR_PERCENT"] > 2
+        return (
+            ScannerRules._number(
+                latest,
+                "ATR_PERCENT",
+            )
+            > 2
+        )
 
     @staticmethod
-    def bb_squeeze(latest):
+    def bb_squeeze(latest: Any) -> bool:
 
-        return latest["BB_WIDTH"] < 0.08
+        return (
+            ScannerRules._number(
+                latest,
+                "BB_WIDTH",
+            )
+            < 0.08
+        )
 
-    # =====================================================
+    # =========================================================
     # PRICE ACTION
-    # =====================================================
+    # =========================================================
 
     @staticmethod
-    def breakout(latest):
+    def breakout(latest: Any) -> bool:
 
-        return latest["BREAKOUT"]
-
-    @staticmethod
-    def breakdown(latest):
-
-        return latest["BREAKDOWN"]
+        return ScannerRules._bool(
+            latest,
+            "BREAKOUT",
+        )
 
     @staticmethod
-    def gap_up(latest):
+    def breakdown(latest: Any) -> bool:
 
-        return latest["GAP_UP"]
-
-    @staticmethod
-    def gap_down(latest):
-
-        return latest["GAP_DOWN"]
+        return ScannerRules._bool(
+            latest,
+            "BREAKDOWN",
+        )
 
     @staticmethod
-    def uptrend(latest):
+    def gap_up(latest: Any) -> bool:
 
-        return latest["UPTREND"]
-
-    @staticmethod
-    def downtrend(latest):
-
-        return latest["DOWNTREND"]
+        return ScannerRules._bool(
+            latest,
+            "GAP_UP",
+        )
 
     @staticmethod
-    def inside_bar(latest):
+    def gap_down(latest: Any) -> bool:
 
-        return latest["INSIDE_BAR"]
-
-    @staticmethod
-    def nr7(latest):
-
-        return latest["NR7"]
-
-    # =====================================================
-    # CANDLESTICK
-    # =====================================================
+        return ScannerRules._bool(
+            latest,
+            "GAP_DOWN",
+        )
 
     @staticmethod
-    def bullish_engulfing(latest):
+    def uptrend(latest: Any) -> bool:
 
-        return latest["BULLISH_ENGULFING"]
-
-    @staticmethod
-    def bearish_engulfing(latest):
-
-        return latest["BEARISH_ENGULFING"]
+        return ScannerRules._bool(
+            latest,
+            "UPTREND",
+        )
 
     @staticmethod
-    def hammer(latest):
+    def downtrend(latest: Any) -> bool:
 
-        return latest["HAMMER"]
+        return ScannerRules._bool(
+            latest,
+            "DOWNTREND",
+        )
 
     @staticmethod
-    def doji(latest):
+    def inside_bar(latest: Any) -> bool:
 
-        return latest["DOJI"]
+        return ScannerRules._bool(
+            latest,
+            "INSIDE_BAR",
+        )
 
-    # =====================================================
+    @staticmethod
+    def nr7(latest: Any) -> bool:
+
+        return ScannerRules._bool(
+            latest,
+            "NR7",
+        )
+
+    # =========================================================
+    # CANDLESTICKS
+    # =========================================================
+
+    @staticmethod
+    def bullish_engulfing(latest: Any) -> bool:
+
+        return ScannerRules._bool(
+            latest,
+            "BULLISH_ENGULFING",
+        )
+
+    @staticmethod
+    def bearish_engulfing(latest: Any) -> bool:
+
+        return ScannerRules._bool(
+            latest,
+            "BEARISH_ENGULFING",
+        )
+
+    @staticmethod
+    def hammer(latest: Any) -> bool:
+
+        return ScannerRules._bool(
+            latest,
+            "HAMMER",
+        )
+
+    @staticmethod
+    def doji(latest: Any) -> bool:
+
+        return ScannerRules._bool(
+            latest,
+            "DOJI",
+        )
+
+    # =========================================================
     # FUNDAMENTALS
-    # =====================================================
+    # =========================================================
 
     @staticmethod
-    def strong_fundamentals(f):
+    def strong_fundamentals(f: Any) -> bool:
 
         return (
-
-            f.roe >= 15
-
+            ScannerRules._number(f, "roe") >= 15
             and
-
-            f.roce >= 15
-
+            ScannerRules._number(f, "roce") >= 15
             and
-
-            f.debt_to_equity < 0.5
-
+            ScannerRules._number(
+                f,
+                "debt_to_equity",
+                999,
+            ) < 0.5
             and
-
-            f.sales_growth > 10
-
+            ScannerRules._number(
+                f,
+                "sales_growth",
+            ) > 10
             and
-
-            f.profit_growth > 10
-
+            ScannerRules._number(
+                f,
+                "profit_growth",
+            ) > 10
         )
 
     @staticmethod
-    def value_stock(f):
+    def value_stock(f: Any) -> bool:
+
+        pe = ScannerRules._number(
+            f,
+            "pe",
+        )
+
+        pb = ScannerRules._number(
+            f,
+            "pb",
+            999,
+        )
 
         return (
-
-            0 < f.pe < 25
-
+            0 < pe < 25
             and
-
-            f.pb < 5
-
+            0 < pb < 5
         )
 
     @staticmethod
-    def quality_stock(f):
+    def quality_stock(f: Any) -> bool:
 
         return (
-
-            f.roe > 20
-
+            ScannerRules._number(f, "roe") > 20
             and
-
-            f.roce > 20
-
+            ScannerRules._number(f, "roce") > 20
         )
 
-    # =====================================================
-    # COMBINATIONS
-    # =====================================================
-
     @staticmethod
-    def breakout_buy(latest):
+    def strong_growth(f: Any) -> bool:
 
         return (
+            ScannerRules._number(
+                f,
+                "sales_growth",
+            ) >= 20
+            and
+            ScannerRules._number(
+                f,
+                "profit_growth",
+            ) >= 20
+        )
 
+    @staticmethod
+    def multibagger_filter(f: Any) -> bool:
+
+        return (
+            ScannerRules._number(f, "roe") >= 20
+            and
+            ScannerRules._number(f, "roce") >= 20
+            and
+            ScannerRules._number(
+                f,
+                "debt_to_equity",
+                999,
+            ) <= 0.30
+            and
+            ScannerRules._number(
+                f,
+                "sales_growth",
+            ) >= 15
+            and
+            ScannerRules._number(
+                f,
+                "profit_growth",
+            ) >= 15
+        )
+
+    # =========================================================
+    # STRATEGY COMBINATIONS
+    # =========================================================
+
+    @staticmethod
+    def breakout_buy(latest: Any) -> bool:
+
+        return (
             ScannerRules.breakout(latest)
-
             and
-
             ScannerRules.ema_bullish(latest)
-
             and
-
             ScannerRules.macd_bullish(latest)
-
             and
-
             ScannerRules.high_volume(latest)
-
         )
 
     @staticmethod
-    def swing_buy(latest):
+    def swing_buy(latest: Any) -> bool:
 
         return (
-
             ScannerRules.uptrend(latest)
-
             and
-
             ScannerRules.rsi_bullish(latest)
-
             and
-
             ScannerRules.medium_volume(latest)
-
         )
 
     @staticmethod
-    def intraday_buy(latest):
+    def intraday_buy(latest: Any) -> bool:
 
         return (
-
             ScannerRules.above_vwap(latest)
-
             and
-
             ScannerRules.high_volume(latest)
-
             and
-
             ScannerRules.macd_bullish(latest)
-
         )
 
     @staticmethod
-    def reversal_buy(latest):
+    def reversal_buy(latest: Any) -> bool:
 
         return (
-
             ScannerRules.rsi_oversold(latest)
-
             and
-
             ScannerRules.hammer(latest)
-
         )
 
     @staticmethod
-    def positional_buy(latest):
+    def positional_buy(latest: Any) -> bool:
 
         return (
-
             ScannerRules.ema_bullish(latest)
-
             and
-
             ScannerRules.breakout(latest)
-
             and
-
             ScannerRules.adx_strong(latest)
-
         )
 
-    # =====================================================
-    # UTILITIES
-    # =====================================================
-
-    @staticmethod
-    def latest(df: pd.DataFrame):
-
-        return df.iloc[-1]
-
-            # =====================================================
+    # =========================================================
     # EMA CROSSOVERS
-    # =====================================================
+    # =========================================================
 
     @staticmethod
-    def ema20_cross_above_50(df):
+    def ema20_cross_above_50(
+        df: pd.DataFrame,
+    ) -> bool:
 
-        return (
+        if len(df) < 2:
+            return False
 
-            (df["EMA_20"].shift(1) <= df["EMA_50"].shift(1))
-
-            &
-
-            (df["EMA_20"] > df["EMA_50"])
-
-        ).iloc[-1]
-
-    @staticmethod
-    def ema50_cross_above_200(df):
-
-        return (
-
-            (df["EMA_50"].shift(1) <= df["EMA_200"].shift(1))
-
-            &
-
-            (df["EMA_50"] > df["EMA_200"])
-
-        ).iloc[-1]
+        return bool(
+            (
+                (df["EMA_20"].shift(1) <= df["EMA_50"].shift(1))
+                &
+                (df["EMA_20"] > df["EMA_50"])
+            ).iloc[-1]
+        )
 
     @staticmethod
-    def ema20_cross_below_50(df):
+    def ema50_cross_above_200(
+        df: pd.DataFrame,
+    ) -> bool:
 
-        return (
+        if len(df) < 2:
+            return False
 
-            (df["EMA_20"].shift(1) >= df["EMA_50"].shift(1))
+        return bool(
+            (
+                (df["EMA_50"].shift(1) <= df["EMA_200"].shift(1))
+                &
+                (df["EMA_50"] > df["EMA_200"])
+            ).iloc[-1]
+        )
 
-            &
+    @staticmethod
+    def ema20_cross_below_50(
+        df: pd.DataFrame,
+    ) -> bool:
 
-            (df["EMA_20"] < df["EMA_50"])
+        if len(df) < 2:
+            return False
 
-        ).iloc[-1]
+        return bool(
+            (
+                (df["EMA_20"].shift(1) >= df["EMA_50"].shift(1))
+                &
+                (df["EMA_20"] < df["EMA_50"])
+            ).iloc[-1]
+        )
 
-    # =====================================================
+    # =========================================================
     # 52 WEEK
-    # =====================================================
+    # =========================================================
 
     @staticmethod
-    def near_52_week_high(df):
+    def near_52_week_high(
+        df: pd.DataFrame,
+    ) -> bool:
 
-        highest = df["high"].rolling(252).max().iloc[-1]
+        if len(df) < 20:
+            return False
+
+        highest = (
+            df["high"]
+            .rolling(252, min_periods=20)
+            .max()
+            .iloc[-1]
+        )
 
         close = df["close"].iloc[-1]
+
+        if pd.isna(highest):
+            return False
 
         return close >= highest * 0.95
 
     @staticmethod
-    def breakout_52_week(df):
+    def breakout_52_week(
+        df: pd.DataFrame,
+    ) -> bool:
 
-        highest = df["high"].shift(1).rolling(252).max().iloc[-1]
+        if len(df) < 21:
+            return False
 
-        return df["close"].iloc[-1] > highest
+        highest = (
+            df["high"]
+            .shift(1)
+            .rolling(252, min_periods=20)
+            .max()
+            .iloc[-1]
+        )
 
-    @staticmethod
-    def near_52_week_low(df):
+        close = df["close"].iloc[-1]
 
-        lowest = df["low"].rolling(252).min().iloc[-1]
+        if pd.isna(highest):
+            return False
 
-        return df["close"].iloc[-1] <= lowest * 1.05
-
-    # =====================================================
-    # DELIVERY & LIQUIDITY
-    # =====================================================
-
-    @staticmethod
-    def high_turnover(latest):
-
-        return latest.get("TURNOVER", 0) >= 10_00_00_000
-
-    @staticmethod
-    def liquid_stock(latest):
-
-        return latest["volume"] >= 500000
+        return close > highest
 
     @staticmethod
-    def high_delivery(latest):
+    def near_52_week_low(
+        df: pd.DataFrame,
+    ) -> bool:
 
-        return latest.get("DELIVERY_PERCENT", 0) >= 50
+        if len(df) < 20:
+            return False
 
-    # =====================================================
-    # OPTIONS
-    # =====================================================
+        lowest = (
+            df["low"]
+            .rolling(252, min_periods=20)
+            .min()
+            .iloc[-1]
+        )
+
+        close = df["close"].iloc[-1]
+
+        if pd.isna(lowest):
+            return False
+
+        return close <= lowest * 1.05
+
+    # =========================================================
+    # DELIVERY / LIQUIDITY
+    # =========================================================
 
     @staticmethod
-    def long_buildup(latest):
+    def high_turnover(latest: Any) -> bool:
 
         return (
-
-            latest.get("OI_CHANGE", 0) > 0
-
-            and
-
-            latest.get("PRICE_CHANGE", 0) > 0
-
+            ScannerRules._number(
+                latest,
+                "TURNOVER",
+            )
+            >= 100_000_000
         )
 
     @staticmethod
-    def short_buildup(latest):
+    def liquid_stock(latest: Any) -> bool:
 
         return (
-
-            latest.get("OI_CHANGE", 0) > 0
-
-            and
-
-            latest.get("PRICE_CHANGE", 0) < 0
-
+            ScannerRules._number(
+                latest,
+                "volume",
+            )
+            >= 500_000
         )
 
     @staticmethod
-    def short_covering(latest):
+    def high_delivery(latest: Any) -> bool:
 
         return (
+            ScannerRules._number(
+                latest,
+                "DELIVERY_PERCENT",
+            )
+            >= 50
+        )
 
-            latest.get("OI_CHANGE", 0) < 0
+    # =========================================================
+    # OPTIONS / F&O
+    # =========================================================
 
+    @staticmethod
+    def long_buildup(latest: Any) -> bool:
+
+        return (
+            ScannerRules._number(
+                latest,
+                "OI_CHANGE",
+            ) > 0
             and
-
-            latest.get("PRICE_CHANGE", 0) > 0
-
+            ScannerRules._number(
+                latest,
+                "PRICE_CHANGE",
+            ) > 0
         )
 
     @staticmethod
-    def long_unwinding(latest):
+    def short_buildup(latest: Any) -> bool:
 
         return (
-
-            latest.get("OI_CHANGE", 0) < 0
-
+            ScannerRules._number(
+                latest,
+                "OI_CHANGE",
+            ) > 0
             and
-
-            latest.get("PRICE_CHANGE", 0) < 0
-
+            ScannerRules._number(
+                latest,
+                "PRICE_CHANGE",
+            ) < 0
         )
 
-    # =====================================================
+    @staticmethod
+    def short_covering(latest: Any) -> bool:
+
+        return (
+            ScannerRules._number(
+                latest,
+                "OI_CHANGE",
+            ) < 0
+            and
+            ScannerRules._number(
+                latest,
+                "PRICE_CHANGE",
+            ) > 0
+        )
+
+    @staticmethod
+    def long_unwinding(latest: Any) -> bool:
+
+        return (
+            ScannerRules._number(
+                latest,
+                "OI_CHANGE",
+            ) < 0
+            and
+            ScannerRules._number(
+                latest,
+                "PRICE_CHANGE",
+            ) < 0
+        )
+
+    # =========================================================
     # CORPORATE ACTIONS
-    # =====================================================
+    # =========================================================
 
     @staticmethod
-    def earnings_today(f):
+    def earnings_today(f: Any) -> bool:
 
-        return getattr(f, "earnings_today", False)
-
-    @staticmethod
-    def dividend_today(f):
-
-        return getattr(f, "dividend_today", False)
-
-    @staticmethod
-    def bonus_issue(f):
-
-        return getattr(f, "bonus_issue", False)
-
-    @staticmethod
-    def split(f):
-
-        return getattr(f, "stock_split", False)
-
-    # =====================================================
-    # GROWTH
-    # =====================================================
-
-    @staticmethod
-    def strong_growth(f):
-
-        return (
-
-            f.sales_growth >= 20
-
-            and
-
-            f.profit_growth >= 20
-
+        return ScannerRules._bool(
+            f,
+            "earnings_today",
         )
 
     @staticmethod
-    def multibagger_filter(f):
+    def dividend_today(f: Any) -> bool:
 
-        return (
-
-            f.roe >= 20
-
-            and
-
-            f.roce >= 20
-
-            and
-
-            f.debt_to_equity <= 0.30
-
-            and
-
-            f.sales_growth >= 15
-
-            and
-
-            f.profit_growth >= 15
-
+        return ScannerRules._bool(
+            f,
+            "dividend_today",
         )
 
-    # =====================================================
-    # INSTITUTIONAL QUALITY
-    # =====================================================
+    @staticmethod
+    def bonus_issue(f: Any) -> bool:
+
+        return ScannerRules._bool(
+            f,
+            "bonus_issue",
+        )
 
     @staticmethod
-    def promoter_holding(f):
+    def split(f: Any) -> bool:
 
-        return f.promoter_holding >= 50
+        return ScannerRules._bool(
+            f,
+            "stock_split",
+        )
 
-    @staticmethod
-    def fii_buying(f):
-
-        return getattr(f, "fii_change", 0) > 0
-
-    @staticmethod
-    def dii_buying(f):
-
-        return getattr(f, "dii_change", 0) > 0
-
-    # =====================================================
-    # MASTER RULE
-    # =====================================================
+    # =========================================================
+    # INSTITUTIONAL / SHAREHOLDING
+    # =========================================================
 
     @staticmethod
-    def trendforge_buy(df, latest, f=None):
+    def promoter_holding(f: Any) -> bool:
+
+        return (
+            ScannerRules._number(
+                f,
+                "promoter_holding",
+            )
+            >= 50
+        )
+
+    @staticmethod
+    def fii_buying(f: Any) -> bool:
+
+        return (
+            ScannerRules._number(
+                f,
+                "fii_change",
+            )
+            > 0
+        )
+
+    @staticmethod
+    def dii_buying(f: Any) -> bool:
+
+        return (
+            ScannerRules._number(
+                f,
+                "dii_change",
+            )
+            > 0
+        )
+
+    # =========================================================
+    # MASTER TREND FORGE FILTER
+    # =========================================================
+
+    @staticmethod
+    def trendforge_buy(
+        df: pd.DataFrame,
+        latest: Any,
+        f: Any = None,
+    ) -> int:
+        """
+        Lightweight pre-score filter.
+
+        This does NOT replace ScoringEngine.
+
+        Returns:
+            0 - 100
+        """
 
         score = 0
 
+        # -----------------------------
+        # Technical
+        # -----------------------------
+
         if ScannerRules.ema_bullish(latest):
             score += 10
+
+        if ScannerRules.ema9_above_26(latest):
+            score += 5
+
+        if ScannerRules.vwma9_above_26(latest):
+            score += 5
 
         if ScannerRules.breakout(latest):
             score += 10
@@ -593,18 +969,47 @@ class ScannerRules:
         if ScannerRules.adx_strong(latest):
             score += 10
 
+        if ScannerRules.above_vwap(latest):
+            score += 5
+
+        if ScannerRules.positive_money_flow(latest):
+            score += 5
+
         if ScannerRules.near_52_week_high(df):
             score += 10
 
-        if f:
+        # -----------------------------
+        # Fundamentals
+        # -----------------------------
+
+        if f is not None:
 
             if ScannerRules.strong_fundamentals(f):
-                score += 20
+                score += 10
 
             if ScannerRules.promoter_holding(f):
-                score += 10
+                score += 5
 
             if ScannerRules.strong_growth(f):
-                score += 10
+                score += 5
 
-        return score
+        return min(
+            score,
+            100,
+        )
+
+    # =========================================================
+    # UTILITY
+    # =========================================================
+
+    @staticmethod
+    def latest(
+        df: pd.DataFrame,
+    ) -> pd.Series:
+
+        if df is None or df.empty:
+            raise ValueError(
+                "Cannot extract latest row from empty DataFrame"
+            )
+
+        return df.iloc[-1]
