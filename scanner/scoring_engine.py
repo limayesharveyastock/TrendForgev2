@@ -1,283 +1,853 @@
 """
-TrendForge v2
-Scoring Engine
+TrendForge v2 - Scoring Engine
+
+Central deterministic scoring layer.
+
+Flow:
+Indicators -> Rules -> Scoring -> Signal
+
+Produces:
+- component scores
+- total score
+- confidence
+- BUY / HOLD / SELL
+- reasons
+- warnings
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
-import json
 from pathlib import Path
+from typing import Any, Mapping
+
 logger = logging.getLogger(__name__)
 
 
-# ==========================================================
+# ============================================================
 # SCORE RESULT
-# ==========================================================
+# ============================================================
 
-@dataclass(slots=True)
+@dataclass
 class ScoreResult:
-
     total: float = 0.0
 
     technical: float = 0.0
-
     fundamental: float = 0.0
-
     options: float = 0.0
-
     corporate: float = 0.0
-
     risk: float = 0.0
 
     confidence: float = 0.0
+    signal: str = "HOLD"
 
-    reasons: list = field(default_factory=list)
+    reasons: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "total": round(self.total, 2),
+            "technical": round(self.technical, 2),
+            "fundamental": round(self.fundamental, 2),
+            "options": round(self.options, 2),
+            "corporate": round(self.corporate, 2),
+            "risk": round(self.risk, 2),
+            "confidence": round(self.confidence, 2),
+            "signal": self.signal,
+            "reasons": list(self.reasons),
+            "warnings": list(self.warnings),
+        }
 
 
-# ==========================================================
+# ============================================================
 # SCORING ENGINE
-# ==========================================================
+# ============================================================
 
 class ScoringEngine:
+    """
+    Master TrendForge scoring engine.
 
-    def __init__(self, weights=None):
+    Positive conditions increase the score.
+    Negative conditions reduce the score.
 
-    self.weights = (
+    The engine itself does not fetch market data.
+    """
 
-        weights
+    CONFIG_DIR = Path("config")
+    WEIGHTS_FILE = CONFIG_DIR / "scoring_weights.json"
 
-        if weights
+    BUY_THRESHOLD = 70.0
+    SELL_THRESHOLD = -30.0
 
-        else self.load_weights()
+    VERSION = "2.1"
 
-    )
+    def __init__(
+        self,
+        weights: Mapping[str, float] | None = None,
+    ) -> None:
 
-    # ------------------------------------------------------
+        if weights is not None:
+            self.weights = {
+                str(key): float(value)
+                for key, value in weights.items()
+            }
+        else:
+            self.weights = self.load_weights()
 
-    def add(
+    # ========================================================
+    # CONFIGURATION
+    # ========================================================
+
+    @classmethod
+    def load_weights(cls) -> dict[str, float]:
+        """Load scoring weights from JSON configuration."""
+
+        if not cls.WEIGHTS_FILE.exists():
+            logger.warning(
+                "Scoring weights file not found: %s",
+                cls.WEIGHTS_FILE,
+            )
+            return {}
+
+        try:
+            with cls.WEIGHTS_FILE.open(
+                "r",
+                encoding="utf-8",
+            ) as file:
+                data = json.load(file)
+
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.error(
+                "Unable to load scoring weights: %s",
+                exc,
+            )
+            return {}
+
+        if not isinstance(data, dict):
+            raise ValueError(
+                "scoring_weights.json must contain a JSON object"
+            )
+
+        return {
+            str(key): float(value)
+            for key, value in data.items()
+        }
+
+    def save_weights(self) -> None:
+        """Persist current weights."""
+
+        self.CONFIG_DIR.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        with self.WEIGHTS_FILE.open(
+            "w",
+            encoding="utf-8",
+        ) as file:
+            json.dump(
+                self.weights,
+                file,
+                indent=4,
+            )
+
+    def update_weight(
+        self,
+        key: str,
+        value: float,
+    ) -> None:
+        self.weights[str(key)] = float(value)
+        self.save_weights()
+
+    def reset_weights(self) -> None:
+        self.weights = self.load_weights()
+
+    # ========================================================
+    # SAFE DATA ACCESS
+    # ========================================================
+
+    @staticmethod
+    def _get(
+        source: Any,
+        key: str,
+        default: Any = None,
+    ) -> Any:
+        """Read from dict-like objects or normal objects."""
+
+        if source is None:
+            return default
+
+        if isinstance(source, Mapping):
+            return source.get(key, default)
+
+        try:
+            return getattr(
+                source,
+                key,
+                default,
+            )
+        except Exception:
+            return default
+
+    @staticmethod
+    def _number(
+        source: Any,
+        key: str,
+        default: float = 0.0,
+    ) -> float:
+        """Safely convert a value to float."""
+
+        value = ScoringEngine._get(
+            source,
+            key,
+            default,
+        )
+
+        try:
+            if value is None:
+                return default
+
+            return float(value)
+
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _rule(
+        rules: Any,
+        name: str,
+        value: Any,
+    ) -> bool:
+        """Safely execute a rule function."""
+
+        function = getattr(
+            rules,
+            name,
+            None,
+        )
+
+        if not callable(function):
+            return False
+
+        try:
+            return bool(
+                function(value)
+            )
+
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            AttributeError,
+            IndexError,
+        ):
+            return False
+
+    def _weight(
+        self,
+        key: str,
+    ) -> float:
+        return float(
+            self.weights.get(
+                key,
+                0.0,
+            )
+        )
+
+    # ========================================================
+    # SCORE ADDITION
+    # ========================================================
+
+    def _add(
         self,
         result: ScoreResult,
         key: str,
         condition: bool,
         category: str,
         reason: str,
-    ):
+        multiplier: float = 1.0,
+    ) -> None:
+        """
+        Add weighted score when condition is true.
+
+        multiplier=-1 means the condition is bearish.
+        """
 
         if not condition:
             return
 
-        value = self.weights.get(key, 0)
+        value = (
+            self._weight(key)
+            * multiplier
+        )
+
+        if value == 0:
+            return
 
         result.total += value
+
+        current = getattr(
+            result,
+            category,
+        )
 
         setattr(
             result,
             category,
-            getattr(result, category) + value,
+            current + value,
         )
 
-        result.reasons.append(reason)
+        if value > 0:
+            result.reasons.append(reason)
+        else:
+            result.warnings.append(reason)
 
-    # ------------------------------------------------------
+    # ========================================================
+    # TECHNICAL
+    # ========================================================
 
     def technical_score(
         self,
-        latest,
-        rules,
-        result,
-    ):
+        latest: Any,
+        rules: Any,
+        result: ScoreResult,
+    ) -> None:
 
-        self.add(
+        self._add(
             result,
             "EMA_ALIGNMENT",
-            rules.ema_bullish(latest),
+            self._rule(
+                rules,
+                "ema_bullish",
+                latest,
+            ),
             "technical",
-            "EMA Alignment",
+            "EMA alignment bullish",
         )
 
-        self.add(
+        self._add(
+            result,
+            "EMA_GOLDEN_CROSS",
+            self._rule(
+                rules,
+                "golden_cross",
+                latest,
+            ),
+            "technical",
+            "Golden cross confirmed",
+        )
+
+        self._add(
+            result,
+            "EMA_GOLDEN_CROSS",
+            self._rule(
+                rules,
+                "death_cross",
+                latest,
+            ),
+            "technical",
+            "Death cross detected",
+            -1.0,
+        )
+
+        self._add(
             result,
             "RSI",
-            rules.rsi_bullish(latest),
+            self._rule(
+                rules,
+                "rsi_bullish",
+                latest,
+            ),
             "technical",
-            "Healthy RSI",
+            "RSI bullish",
         )
 
-        self.add(
+        self._add(
             result,
             "MACD",
-            rules.macd_bullish(latest),
+            self._rule(
+                rules,
+                "macd_bullish",
+                latest,
+            ),
             "technical",
-            "MACD Bullish",
+            "MACD bullish",
         )
 
-        self.add(
+        self._add(
             result,
             "ADX",
-            rules.adx_strong(latest),
+            self._rule(
+                rules,
+                "adx_strong",
+                latest,
+            ),
             "technical",
-            "Strong ADX",
+            "ADX confirms trend strength",
         )
 
-        self.add(
+        self._add(
             result,
             "RVOL",
-            rules.high_volume(latest),
+            self._rule(
+                rules,
+                "high_volume",
+                latest,
+            ),
             "technical",
-            "High Relative Volume",
+            "High relative volume",
         )
 
-        self.add(
+        self._add(
+            result,
+            "VWAP",
+            self._rule(
+                rules,
+                "above_vwap",
+                latest,
+            ),
+            "technical",
+            "Price above VWAP",
+        )
+
+        self._add(
+            result,
+            "CMF",
+            self._rule(
+                rules,
+                "positive_money_flow",
+                latest,
+            ),
+            "technical",
+            "Positive money flow",
+        )
+
+        self._add(
             result,
             "BREAKOUT",
-            rules.breakout(latest),
+            self._rule(
+                rules,
+                "breakout",
+                latest,
+            ),
             "technical",
-            "20-Day Breakout",
+            "Breakout confirmed",
         )
 
-    # ------------------------------------------------------
+        self._add(
+            result,
+            "BREAKOUT",
+            self._rule(
+                rules,
+                "breakdown",
+                latest,
+            ),
+            "technical",
+            "Breakdown detected",
+            -1.0,
+        )
+
+        self._add(
+            result,
+            "ATR_EXPANSION",
+            self._rule(
+                rules,
+                "atr_expansion",
+                latest,
+            ),
+            "technical",
+            "ATR expansion",
+        )
+
+        self._add(
+            result,
+            "BB_SQUEEZE",
+            self._rule(
+                rules,
+                "bb_squeeze",
+                latest,
+            ),
+            "technical",
+            "Bollinger squeeze",
+        )
+
+        self._add(
+            result,
+            "ENGULFING",
+            self._rule(
+                rules,
+                "bullish_engulfing",
+                latest,
+            ),
+            "technical",
+            "Bullish engulfing",
+        )
+
+        self._add(
+            result,
+            "ENGULFING",
+            self._rule(
+                rules,
+                "bearish_engulfing",
+                latest,
+            ),
+            "technical",
+            "Bearish engulfing",
+            -1.0,
+        )
+
+        self._add(
+            result,
+            "HAMMER",
+            self._rule(
+                rules,
+                "hammer",
+                latest,
+            ),
+            "technical",
+            "Hammer pattern",
+        )
+
+    # ========================================================
+    # FUNDAMENTAL
+    # ========================================================
 
     def fundamental_score(
         self,
-        fundamentals,
-        rules,
-        result,
-    ):
+        fundamentals: Any,
+        rules: Any,
+        result: ScoreResult,
+    ) -> None:
 
         if fundamentals is None:
             return
 
-        self.add(
+        self._add(
             result,
             "ROE",
-            fundamentals.roe > 15,
+            self._number(
+                fundamentals,
+                "roe",
+            ) >= 15,
             "fundamental",
-            "ROE > 15%",
+            "ROE >= 15%",
         )
 
-        self.add(
+        self._add(
             result,
             "ROCE",
-            fundamentals.roce > 15,
+            self._number(
+                fundamentals,
+                "roce",
+            ) >= 15,
             "fundamental",
-            "ROCE > 15%",
+            "ROCE >= 15%",
         )
 
-        self.add(
+        pe = self._number(
+            fundamentals,
+            "pe",
+        )
+
+        self._add(
             result,
             "PE",
-            0 < fundamentals.pe < 30,
+            0 < pe < 30,
             "fundamental",
             "Healthy PE",
         )
 
-        self.add(
+        debt = self._number(
+            fundamentals,
+            "debt_to_equity",
+            999,
+        )
+
+        self._add(
             result,
             "DEBT",
-            fundamentals.debt_to_equity < 0.5,
+            debt < 0.5,
             "fundamental",
-            "Low Debt",
+            "Low debt",
         )
 
-        self.add(
+        self._add(
             result,
             "SALES_GROWTH",
-            fundamentals.sales_growth > 10,
+            self._number(
+                fundamentals,
+                "sales_growth",
+            ) > 10,
             "fundamental",
-            "Sales Growth",
+            "Sales growth > 10%",
         )
 
-        self.add(
+        self._add(
             result,
             "PROFIT_GROWTH",
-            fundamentals.profit_growth > 10,
+            self._number(
+                fundamentals,
+                "profit_growth",
+            ) > 10,
             "fundamental",
-            "Profit Growth",
+            "Profit growth > 10%",
         )
 
-    # ------------------------------------------------------
+        self._add(
+            result,
+            "PROMOTER",
+            self._number(
+                fundamentals,
+                "promoter_holding",
+            ) >= 50,
+            "fundamental",
+            "Promoter holding >= 50%",
+        )
+
+    # ========================================================
+    # OPTIONS
+    # ========================================================
 
     def options_score(
         self,
-        latest,
-        rules,
-        result,
-    ):
+        latest: Any,
+        rules: Any,
+        result: ScoreResult,
+    ) -> None:
 
-        self.add(
+        self._add(
             result,
             "LONG_BUILDUP",
-            rules.long_buildup(latest),
+            self._rule(
+                rules,
+                "long_buildup",
+                latest,
+            ),
             "options",
-            "Long Build-up",
+            "Long build-up",
         )
 
-        self.add(
+        self._add(
             result,
             "SHORT_COVERING",
-            rules.short_covering(latest),
+            self._rule(
+                rules,
+                "short_covering",
+                latest,
+            ),
             "options",
-            "Short Covering",
+            "Short covering",
         )
 
-    # ------------------------------------------------------
+        self._add(
+            result,
+            "LONG_BUILDUP",
+            self._rule(
+                rules,
+                "short_buildup",
+                latest,
+            ),
+            "options",
+            "Short build-up",
+            -1.0,
+        )
+
+        self._add(
+            result,
+            "LONG_BUILDUP",
+            self._rule(
+                rules,
+                "long_unwinding",
+                latest,
+            ),
+            "options",
+            "Long unwinding",
+            -1.0,
+        )
+
+    # ========================================================
+    # CORPORATE
+    # ========================================================
 
     def corporate_score(
         self,
-        fundamentals,
-        rules,
-        result,
-    ):
+        data: Any,
+        rules: Any,
+        result: ScoreResult,
+    ) -> None:
 
-        if fundamentals is None:
+        if data is None:
             return
 
-        self.add(
+        self._add(
             result,
             "EARNINGS",
-            rules.earnings_today(fundamentals),
+            self._rule(
+                rules,
+                "earnings_today",
+                data,
+            ),
             "corporate",
-            "Earnings Event",
+            "Earnings event",
         )
 
-        self.add(
+        self._add(
             result,
             "BONUS",
-            rules.bonus_issue(fundamentals),
+            self._rule(
+                rules,
+                "bonus_issue",
+                data,
+            ),
             "corporate",
-            "Bonus Issue",
+            "Bonus issue",
         )
 
-        self.add(
+        self._add(
             result,
             "DIVIDEND",
-            rules.dividend_today(fundamentals),
+            self._rule(
+                rules,
+                "dividend_today",
+                data,
+            ),
             "corporate",
-            "Dividend",
+            "Dividend event",
         )
 
-    # ------------------------------------------------------
+    # ========================================================
+    # RISK
+    # ========================================================
+
+    def risk_score(
+        self,
+        latest: Any,
+        result: ScoreResult,
+    ) -> None:
+
+        high_beta = bool(
+            self._get(
+                latest,
+                "HIGH_BETA",
+                False,
+            )
+        )
+
+        low_liquidity = bool(
+            self._get(
+                latest,
+                "LOW_LIQUIDITY",
+                False,
+            )
+        )
+
+        if high_beta:
+
+            value = self._weight(
+                "HIGH_BETA"
+            )
+
+            result.total += value
+            result.risk += value
+
+            result.warnings.append(
+                "High beta risk"
+            )
+
+        if low_liquidity:
+
+            value = self._weight(
+                "LOW_LIQUIDITY"
+            )
+
+            result.total += value
+            result.risk += value
+
+            result.warnings.append(
+                "Low liquidity risk"
+            )
+
+    # ========================================================
+    # MAXIMUM SCORE
+    # ========================================================
+
+    def maximum_score(self) -> float:
+
+        return sum(
+            max(
+                value,
+                0.0,
+            )
+            for value in self.weights.values()
+        )
+
+    # ========================================================
+    # CONFIDENCE
+    # ========================================================
 
     def calculate_confidence(
         self,
-        result,
-    ):
+        result: ScoreResult,
+    ) -> None:
 
-        result.confidence = min(
-            100,
-            round(result.total),
+        maximum = self.maximum_score()
+
+        if maximum <= 0:
+            result.confidence = 0.0
+            return
+
+        result.confidence = max(
+            0.0,
+            min(
+                100.0,
+                abs(
+                    result.total
+                    / maximum
+                    * 100.0
+                ),
+            ),
         )
 
-    # ------------------------------------------------------
+    # ========================================================
+    # SIGNAL
+    # ========================================================
+
+    @classmethod
+    def signal_from_score(
+        cls,
+        score: float,
+        maximum: float,
+    ) -> str:
+
+        if maximum <= 0:
+            return "HOLD"
+
+        normalized = (
+            score
+            / maximum
+            * 100.0
+        )
+
+        if normalized >= cls.BUY_THRESHOLD:
+            return "BUY"
+
+        if normalized <= cls.SELL_THRESHOLD:
+            return "SELL"
+
+        return "HOLD"
+
+    # ========================================================
+    # MASTER SCORE
+    # ========================================================
 
     def score(
         self,
-        latest,
-        rules,
-        fundamentals=None,
-    ):
+        latest: Any,
+        rules: Any,
+        fundamentals: Any = None,
+    ) -> ScoreResult:
 
         result = ScoreResult()
 
@@ -305,77 +875,55 @@ class ScoringEngine:
             result,
         )
 
+        self.risk_score(
+            latest,
+            result,
+        )
+
         self.calculate_confidence(
             result,
         )
 
+        result.signal = self.signal_from_score(
+            result.total,
+            self.maximum_score(),
+        )
+
         return result
 
-    # ------------------------------------------------------
+    # ========================================================
+    # DICT API
+    # ========================================================
 
-    def update_weight(
-    self,
-    key,
-    value,
-):
-
-    self.weights[key] = value
-
-    self.save_weights()
-
-    # ------------------------------------------------------
-
-    def reset_weights(self):
-
-    self.weights = self.load_weights()
-
-    # ------------------------------------------------------
-
-    def health(
+    def score_dict(
         self,
-    ):
+        latest: Any,
+        rules: Any,
+        fundamentals: Any = None,
+    ) -> dict[str, Any]:
+
+        return self.score(
+            latest,
+            rules,
+            fundamentals,
+        ).as_dict()
+
+    # ========================================================
+    # HEALTH
+    # ========================================================
+
+    def health(self) -> dict[str, Any]:
 
         return {
-
             "status": "healthy",
-
-            "weights_loaded": len(self.weights),
-
-            "version": "2.0",
-
+            "version": self.VERSION,
+            "weights_loaded": len(
+                self.weights
+            ),
+            "maximum_score": round(
+                self.maximum_score(),
+                2,
+            ),
+            "buy_threshold": self.BUY_THRESHOLD,
+            "sell_threshold": self.SELL_THRESHOLD,
         }
-        CONFIG_DIR = Path("config")
-
-        WEIGHTS_FILE = (
-        CONFIG_DIR /
-        "scoring_weights.json"
-        )    
-        @staticmethod
-def load_weights():
-
-    if not WEIGHTS_FILE.exists():
-
-        raise FileNotFoundError(
-            WEIGHTS_FILE
-        )
-
-    with open(
-        WEIGHTS_FILE,
-        "r",
-        encoding="utf8",
-    ) as f:
-
-        return json.load(f)
-        def save_weights(self):
-
-    with open(
-        WEIGHTS_FILE,
-        "w",
-        encoding="utf8",
-    ) as f:
-
-        json.dump(
-            self.weights,
-            f,
-            indent=4,
-        )
