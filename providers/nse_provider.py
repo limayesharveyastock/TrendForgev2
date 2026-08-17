@@ -1,25 +1,23 @@
 """
-providers/nse_provider.py
-=========================
+TrendForge v2
+NSE Market Data Provider
 
-Centralized NSE data provider used across TrendForge.
-
-Features
---------
-- Index quotes
-- Market status
-- Option Chain
-- Bhavcopy
-- Holidays
+Responsibilities
+----------------
+- NSE market status
+- Equity quotes
+- Index data
+- Option chains
+- FII/DII
 - Corporate actions
+- Bulk deals
+- Block deals
+- Market breadth
+- Gainers / losers
+- Holidays
 - Circulars
-- Bulk / Block Deals
-- FII/DII data
-- Market Breadth
-- Gainers / Losers
-- Most Active Stocks
-- Retry handling
-- In-memory caching
+- Session management
+- Retry + caching
 """
 
 from __future__ import annotations
@@ -28,33 +26,52 @@ import logging
 import threading
 import time
 from functools import wraps
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import requests
+
 
 logger = logging.getLogger(__name__)
 
 
 class NSEProvider:
-    _instance = None
-    _lock = threading.Lock()
+
+    VERSION = "2.1"
 
     BASE_URL = "https://www.nseindia.com"
 
+    CACHE_TTL = 60
+    RETRIES = 3
+    RETRY_DELAY = 1.0
+
     HEADERS = {
-        "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Accept-Language":
-            "en-US,en;q=0.9",
-        "Accept":
-            "application/json,text/plain,*/*",
-        "Referer":
-            "https://www.nseindia.com/",
-        "Connection":
-            "keep-alive"
+        "User-Agent": (
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/151.0 Safari/537.36"
+        ),
+        "Accept": (
+            "application/json,"
+            "text/plain,"
+            "*/*"
+        ),
+        "Accept-Language": (
+            "en-US,en;q=0.9"
+        ),
+        "Referer": (
+            "https://www.nseindia.com/"
+        ),
+        "Connection": "keep-alive",
     }
 
-    CACHE_TTL = 60
+    _instance = None
+    _lock = threading.Lock()
+
+    # =========================================================
+    # SINGLETON
+    # =========================================================
 
     def __new__(cls):
 
@@ -63,285 +80,367 @@ class NSEProvider:
             with cls._lock:
 
                 if cls._instance is None:
-                    cls._instance = super().__new__(cls)
+
+                    cls._instance = (
+                        super().__new__(cls)
+                    )
 
         return cls._instance
 
     def __init__(self):
 
-        if hasattr(self, "_initialized"):
+        if getattr(
+            self,
+            "_initialized",
+            False,
+        ):
             return
 
         self.session = requests.Session()
-        self.session.headers.update(self.HEADERS)
 
-        self.cache = {}
+        self.session.headers.update(
+            self.HEADERS
+        )
 
-        self._initialize_session()
+        self.cache: dict[
+            str,
+            tuple[Any, float],
+        ] = {}
 
         self._initialized = True
 
-    ####################################################################
-    # Session
-    ####################################################################
+        self._initialize_session()
 
-    def _initialize_session(self):
+    # =========================================================
+    # SESSION
+    # =========================================================
+
+    def _initialize_session(self) -> None:
 
         try:
 
-            self.session.get(
+            response = self.session.get(
                 self.BASE_URL,
-                timeout=10
+                timeout=10,
             )
 
-            logger.info("NSE session initialized.")
+            response.raise_for_status()
 
-        except Exception as e:
+            logger.info(
+                "NSE session initialized"
+            )
 
-            logger.exception(e)
+        except Exception as exc:
 
-    ####################################################################
-    # Retry
-    ####################################################################
+            logger.warning(
+                "NSE session initialization failed: %s",
+                exc,
+            )
 
-    @staticmethod
-    def retry(func):
+    def refresh_session(self) -> None:
 
-        @wraps(func)
-        def wrapper(*args, **kwargs):
+        try:
 
-            retries = 3
-            delay = 1
+            self.session.close()
 
-            for attempt in range(retries):
+        except Exception:
+            pass
 
-                try:
-                    return func(*args, **kwargs)
+        self.session = requests.Session()
 
-                except Exception as e:
+        self.session.headers.update(
+            self.HEADERS
+        )
 
-                    logger.warning(
-                        "Retry %s : %s",
-                        attempt + 1,
-                        e
-                    )
+        self._initialize_session()
 
-                    time.sleep(delay)
+    # =========================================================
+    # CACHE
+    # =========================================================
 
-                    delay *= 2
+    def _cache_get(
+        self,
+        key: str,
+    ) -> Any:
 
-            raise Exception("NSE request failed.")
+        item = self.cache.get(
+            key
+        )
 
-        return wrapper
-
-    ####################################################################
-    # Cache
-    ####################################################################
-
-    def _cache_get(self, key):
-
-        if key not in self.cache:
+        if item is None:
             return None
 
-        value, timestamp = self.cache[key]
+        value, timestamp = item
 
-        if time.time() - timestamp > self.CACHE_TTL:
-            del self.cache[key]
+        if (
+            time.time()
+            - timestamp
+            > self.CACHE_TTL
+        ):
+
+            self.cache.pop(
+                key,
+                None,
+            )
+
             return None
 
         return value
 
-    def _cache_set(self, key, value):
+    def _cache_set(
+        self,
+        key: str,
+        value: Any,
+    ) -> None:
 
         self.cache[key] = (
             value,
-            time.time()
+            time.time(),
         )
 
-    ####################################################################
-    # Request
-    ####################################################################
+    def clear_cache(self) -> None:
 
-    @retry
-    def _get(self, endpoint):
+        self.cache.clear()
 
-        cached = self._cache_get(endpoint)
+    # =========================================================
+    # HTTP
+    # =========================================================
 
-        if cached is not None:
-            return cached
+    def _get(
+        self,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        cache: bool = True,
+    ) -> Any:
 
-        url = f"{self.BASE_URL}{endpoint}"
+        params = params or {}
 
-        response = self.session.get(
-            url,
-            timeout=15
+        cache_key = (
+            endpoint
+            + "?"
+            + "&".join(
+                f"{key}={value}"
+                for key, value in sorted(
+                    params.items()
+                )
+            )
         )
 
-        response.raise_for_status()
+        if cache:
 
-        data = response.json()
+            cached = self._cache_get(
+                cache_key
+            )
 
-        self._cache_set(endpoint, data)
+            if cached is not None:
+                return cached
 
-        return data
+        url = (
+            f"{self.BASE_URL}"
+            f"{endpoint}"
+        )
 
-    ####################################################################
-    # Market Status
-    ####################################################################
+        last_error = None
+
+        for attempt in range(
+            self.RETRIES
+        ):
+
+            try:
+
+                response = (
+                    self.session.get(
+                        url,
+                        params=params,
+                        timeout=15,
+                    )
+                )
+
+                # NSE may return 401/403 when
+                # the session expires.
+
+                if response.status_code in (
+                    401,
+                    403,
+                ):
+
+                    self.refresh_session()
+
+                    continue
+
+                response.raise_for_status()
+
+                data = response.json()
+
+                if cache:
+
+                    self._cache_set(
+                        cache_key,
+                        data,
+                    )
+
+                return data
+
+            except Exception as exc:
+
+                last_error = exc
+
+                logger.warning(
+                    "NSE request failed "
+                    "(attempt %s/%s): %s",
+                    attempt + 1,
+                    self.RETRIES,
+                    exc,
+                )
+
+                if (
+                    attempt
+                    < self.RETRIES - 1
+                ):
+
+                    time.sleep(
+                        self.RETRY_DELAY
+                        * (2 ** attempt)
+                    )
+
+        raise RuntimeError(
+            f"NSE request failed: "
+            f"{last_error}"
+        )
+
+    # =========================================================
+    # MARKET STATUS
+    # =========================================================
 
     def market_status(self):
 
-        return self._get("/api/marketStatus")
-
-    ####################################################################
-    # Index Quote
-    ####################################################################
-
-    def index_quote(self, index_name):
-
-        endpoint = (
-            f"/api/allIndices?index={index_name}"
+        return self._get(
+            "/api/marketStatus"
         )
 
-        return self._get(endpoint)
+    # =========================================================
+    # EQUITY QUOTE
+    # =========================================================
 
-    ####################################################################
-    # Equity Quote
-    ####################################################################
-
-    def equity_quote(self, symbol):
-
-        endpoint = (
-            f"/api/quote-equity?symbol={symbol}"
-        )
-
-        return self._get(endpoint)
-
-    ####################################################################
-    # Option Chain
-    ####################################################################
-
-    def option_chain(self, symbol):
-
-        endpoint = (
-            f"/api/option-chain-equities?symbol={symbol}"
-        )
-
-        return self._get(endpoint)
-
-    ####################################################################
-    # Market Breadth
-    ####################################################################
-
-    def market_breadth(self):
-
-        return self._get("/api/equity-stockIndices?index=NIFTY%2050")
-
-    ####################################################################
-    # Top Gainers
-    ####################################################################
-
-    def top_gainers(self):
+    def equity_quote(
+        self,
+        symbol: str,
+    ):
 
         return self._get(
-            "/api/live-analysis-variations?index=gainers"
+            "/api/quote-equity",
+            params={
+                "symbol": symbol.upper()
+            },
         )
 
-    ####################################################################
-    # Top Losers
-    ####################################################################
+    def quote(
+        self,
+        symbol: str,
+    ):
 
-    def top_losers(self):
+        return self.equity_quote(
+            symbol
+        )
+
+    # =========================================================
+    # INDEX QUOTE
+    # =========================================================
+
+    def index_quote(
+        self,
+        index_name: str,
+    ):
 
         return self._get(
-            "/api/live-analysis-variations?index=losers"
+            "/api/allIndices",
+            params={
+                "index": index_name
+            },
         )
 
-    ####################################################################
-    # Most Active
-    ####################################################################
+    # =========================================================
+    # MAJOR INDICES
+    # =========================================================
 
-    def most_active(self):
+    def nifty50(self):
+
+        return self.index_quote(
+            "NIFTY 50"
+        )
+
+    def banknifty(self):
+
+        return self.index_quote(
+            "NIFTY BANK"
+        )
+
+    def finnifty(self):
+
+        return self.index_quote(
+            "NIFTY FINANCIAL SERVICES"
+        )
+
+    def midcap(self):
+
+        return self.index_quote(
+            "NIFTY MIDCAP 100"
+        )
+
+    def smallcap(self):
+
+        return self.index_quote(
+            "NIFTY SMALLCAP 100"
+        )
+
+    # =========================================================
+    # OPTION CHAIN
+    # =========================================================
+
+    def option_chain(
+        self,
+        symbol: str,
+    ):
 
         return self._get(
-            "/api/live-analysis-most-active-securities"
+            "/api/option-chain-equities",
+            params={
+                "symbol": symbol.upper()
+            },
+            cache=False,
         )
 
-    ####################################################################
-    # FII DII
-    ####################################################################
-
-    def fii_dii(self):
+    def index_option_chain(
+        self,
+        symbol: str,
+    ):
 
         return self._get(
-            "/api/fiiDiiTradeReact"
+            "/api/option-chain-indices",
+            params={
+                "symbol": symbol.upper()
+            },
+            cache=False,
         )
 
-    ####################################################################
-    # Holidays
-    ####################################################################
+    # =========================================================
+    # MARKET BREADTH
+    # =========================================================
 
-    def holidays(self):
+    def market_breadth(
+        self,
+    ):
 
         return self._get(
-            "/api/holiday-master?type=trading"
+            "/api/equity-stockIndices",
+            params={
+                "index": "NIFTY 500"
+            },
         )
 
-    ####################################################################
-    # Circulars
-    ####################################################################
-
-    def circulars(self):
-
-        return self._get(
-            "/api/circulars"
-        )
-
-    ####################################################################
-    # Corporate Actions
-    ####################################################################
-
-    def corporate_actions(self):
-
-        return self._get(
-            "/api/corporates-corporateActions"
-        )
-
-    ####################################################################
-    # Bulk Deals
-    ####################################################################
-
-    def bulk_deals(self):
-
-        return self._get(
-            "/api/historicalOR/bulk-deals"
-        )
-
-    ####################################################################
-    # Block Deals
-    ####################################################################
-
-    def block_deals(self):
-
-        return self._get(
-            "/api/historicalOR/block-deals"
-        )
-
-    ####################################################################
-    # Bhavcopy
-    ####################################################################
-
-    def bhavcopy(self):
-
-        return self._get(
-            "/api/reports?archives=downloads"
-        )
-
-    ####################################################################
-    # Advance Decline
-    ####################################################################
-
-    def advance_decline(self):
+    def advance_decline(
+        self,
+    ) -> dict[str, int]:
 
         data = self.market_breadth()
 
@@ -349,81 +448,249 @@ class NSEProvider:
         declines = 0
         unchanged = 0
 
-        try:
+        rows = []
 
-            for stock in data["data"]:
+        if isinstance(
+            data,
+            dict,
+        ):
 
-                change = stock.get("change", 0)
+            rows = data.get(
+                "data",
+                [],
+            )
 
-                if change > 0:
-                    advances += 1
-                elif change < 0:
-                    declines += 1
-                else:
-                    unchanged += 1
+        for stock in rows:
 
-        except Exception:
-            pass
+            change = stock.get(
+                "change",
+                0,
+            )
+
+            try:
+                change = float(
+                    change
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                change = 0
+
+            if change > 0:
+
+                advances += 1
+
+            elif change < 0:
+
+                declines += 1
+
+            else:
+
+                unchanged += 1
 
         return {
             "advances": advances,
             "declines": declines,
-            "unchanged": unchanged
+            "unchanged": unchanged,
         }
 
-    ####################################################################
-    # Convenience
-    ####################################################################
+    # =========================================================
+    # GAINERS
+    # =========================================================
 
-    def nifty50(self):
+    def top_gainers(self):
 
-        return self.index_quote("NIFTY 50")
+        return self._get(
+            "/api/live-analysis-variations",
+            params={
+                "index": "gainers"
+            },
+        )
 
-    def banknifty(self):
+    # =========================================================
+    # LOSERS
+    # =========================================================
 
-        return self.index_quote("NIFTY BANK")
+    def top_losers(self):
 
-    def finnifty(self):
+        return self._get(
+            "/api/live-analysis-variations",
+            params={
+                "index": "losers"
+            },
+        )
 
-        return self.index_quote("NIFTY FINANCIAL SERVICES")
+    # =========================================================
+    # MOST ACTIVE
+    # =========================================================
 
-    def midcap(self):
+    def most_active(self):
 
-        return self.index_quote("NIFTY MIDCAP 100")
+        return self._get(
+            "/api/live-analysis-most-active-securities"
+        )
 
-    def smallcap(self):
+    # =========================================================
+    # FII / DII
+    # =========================================================
 
-        return self.index_quote("NIFTY SMALLCAP 100")
+    def fii_dii(self):
 
+        return self._get(
+            "/api/fiiDiiTradeReact",
+            cache=False,
+        )
+
+    # =========================================================
+    # CORPORATE ACTIONS
+    # =========================================================
+
+    def corporate_actions(
+        self,
+    ):
+
+        return self._get(
+            "/api/corporates-corporateActions",
+            cache=False,
+        )
+
+    # =========================================================
+    # BULK DEALS
+    # =========================================================
+
+    def bulk_deals(
+        self,
+    ):
+
+        return self._get(
+            "/api/historicalOR/bulk-deals",
+            cache=False,
+        )
+
+    # =========================================================
+    # BLOCK DEALS
+    # =========================================================
+
+    def block_deals(
+        self,
+    ):
+
+        return self._get(
+            "/api/historicalOR/block-deals",
+            cache=False,
+        )
+
+    # =========================================================
+    # HOLIDAYS
+    # =========================================================
+
+    def holidays(
+        self,
+    ):
+
+        return self._get(
+            "/api/holiday-master",
+            params={
+                "type": "trading"
+            },
+            cache=False,
+        )
+
+    # =========================================================
+    # CIRCULARS
+    # =========================================================
+
+    def circulars(
+        self,
+    ):
+
+        return self._get(
+            "/api/circulars",
+            cache=False,
+        )
+
+    # =========================================================
+    # BHAVCOPY / REPORTS
+    # =========================================================
+
+    def reports(
+        self,
+    ):
+
+        return self._get(
+            "/api/reports",
+            params={
+                "archives": "downloads"
+            },
+            cache=False,
+        )
+
+    # =========================================================
+    # CONVENIENCE
+    # =========================================================
+
+    def stock_snapshot(
+        self,
+        symbol: str,
+    ) -> dict[str, Any]:
+
+        quote = self.equity_quote(
+            symbol
+        )
+
+        return {
+            "symbol": symbol.upper(),
+            "quote": quote,
+        }
+
+    # =========================================================
+    # HEALTH
+    # =========================================================
+
+    def health(
+        self,
+    ) -> dict[str, Any]:
+
+        return {
+            "provider": "nse",
+            "version": self.VERSION,
+            "session": (
+                self.session is not None
+            ),
+            "base_url": self.BASE_URL,
+        }
+
+    def ping(
+        self,
+    ) -> bool:
+
+        try:
+
+            self.market_status()
+
+            return True
+
+        except Exception:
+
+            logger.exception(
+                "NSE ping failed"
+            )
+
+            return False
+
+
+# =============================================================
+# SINGLETON
+# =============================================================
 
 nse_provider = NSEProvider()
 
-class NSEProvider:
 
-    BASE = "https://www.nseindia.com/api"
+# =============================================================
+# FACTORY
+# =============================================================
 
-    def __init__(self):
+def get_nse_provider() -> NSEProvider:
 
-        self.session = requests.Session()
-
-    def market_status(self):
-
-        return self.session.get(
-
-            f"{self.BASE}/marketStatus"
-
-        ).json()
-
-    def quote(self, symbol):
-
-        return self.session.get(
-
-            f"{self.BASE}/quote-equity",
-
-            params={
-
-                "symbol": symbol
-
-            }
-
-        ).json()
+    return nse_provider
