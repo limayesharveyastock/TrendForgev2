@@ -1,16 +1,20 @@
 """
-providers/kite_provider.py
+TrendForge v2
+Kite Market Data Provider
 
-Centralized Kite Provider
--------------------------
-Handles all communication with Zerodha Kite APIs.
-
-Used by:
-- scanner_engine
-- trade_executor
-- portfolio_manager
-- risk_manager
-- strategy_engine
+Responsibilities
+----------------
+- KiteConnect authentication
+- Historical OHLCV
+- Live quotes
+- Instruments
+- Positions
+- Orders
+- Holdings
+- LTP
+- OHLC
+- Normalized DataFrame output
+- Retry handling
 """
 
 from __future__ import annotations
@@ -18,371 +22,683 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from functools import wraps
-from typing import Dict, List, Optional, Any
+from datetime import datetime, timedelta
+from typing import Any, Iterable, Mapping
 
-from abc import ABC
 import pandas as pd
 
-from kiteconnect import KiteConnect, KiteException
+try:
+    from kiteconnect import KiteConnect
+except ImportError:
+    KiteConnect = None
 
-from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
 
 class KiteProvider:
     """
-    Singleton wrapper around KiteConnect.
+    Single Kite provider.
+
+    This intentionally replaces the duplicate class definitions
+    previously present in the repository.
     """
+
+    VERSION = "2.1"
+
+    RETRIES = 3
+    RETRY_DELAY = 1.0
 
     _instance = None
     _lock = threading.Lock()
 
-    def __new__(cls):
+    def __new__(
+        cls,
+        *args: Any,
+        **kwargs: Any,
+    ):
         if cls._instance is None:
+
             with cls._lock:
+
                 if cls._instance is None:
-                    cls._instance = super().__new__(cls)
+
+                    cls._instance = super().__new__(
+                        cls
+                    )
+
         return cls._instance
 
-    def __init__(self):
+    def __init__(
+        self,
+        api_key: str | None = None,
+        access_token: str | None = None,
+    ) -> None:
 
-        if hasattr(self, "_initialized"):
+        if getattr(
+            self,
+            "_initialized",
+            False,
+        ):
+            if api_key:
+                self.api_key = api_key
+
+            if access_token:
+                self.access_token = access_token
+
             return
 
-        self.api_key = settings.KITE_API_KEY
-        self.api_secret = settings.KITE_API_SECRET
-        self.access_token = None
+        self.api_key = api_key
+        self.access_token = access_token
 
-        self.kite = KiteConnect(api_key=self.api_key)
+        self.client = None
 
         self._initialized = True
 
-    # -------------------------------------------------------------
+        self._create_client()
 
-    def set_access_token(self, access_token: str):
-        self.access_token = access_token
-        self.kite.set_access_token(access_token)
+    # =========================================================
+    # CLIENT
+    # =========================================================
 
-    # -------------------------------------------------------------
+    def _create_client(self) -> None:
 
-    def login_url(self) -> str:
-        return self.kite.login_url()
+        if KiteConnect is None:
 
-    # -------------------------------------------------------------
+            logger.warning(
+                "kiteconnect is not installed."
+            )
 
-    def generate_session(self, request_token: str):
+            self.client = None
 
-        data = self.kite.generate_session(
-            request_token=request_token,
-            api_secret=self.api_secret
-        )
+            return
 
-        token = data["access_token"]
+        if not self.api_key:
 
-        self.set_access_token(token)
+            logger.warning(
+                "Kite API key not configured."
+            )
 
-        return data
-
-    # -------------------------------------------------------------
-
-    def is_logged_in(self) -> bool:
+            return
 
         try:
-            self.kite.profile()
-            return True
+
+            self.client = KiteConnect(
+                api_key=self.api_key
+            )
+
+            if self.access_token:
+
+                self.client.set_access_token(
+                    self.access_token
+                )
 
         except Exception:
-            return False
 
-    # -------------------------------------------------------------
+            logger.exception(
+                "Failed to initialize Kite client"
+            )
 
-    def profile(self):
+            self.client = None
 
-        return self.kite.profile()
+    # =========================================================
+    # AUTH
+    # =========================================================
 
-    # -------------------------------------------------------------
+    def configure(
+        self,
+        api_key: str,
+        access_token: str | None = None,
+    ) -> "KiteProvider":
 
-    def margins(self):
+        self.api_key = api_key
+        self.access_token = access_token
 
-        return self.kite.margins()
+        self._create_client()
 
-    # -------------------------------------------------------------
+        return self
 
-    def holdings(self):
+    def set_access_token(
+        self,
+        access_token: str,
+    ) -> None:
 
-        return self.kite.holdings()
+        self.access_token = access_token
 
-    # -------------------------------------------------------------
+        if self.client is not None:
 
-    def positions(self):
+            self.client.set_access_token(
+                access_token
+            )
 
-        return self.kite.positions()
+    def login_url(self) -> str | None:
 
-    # -------------------------------------------------------------
+        if self.client is None:
+            return None
 
-    def orders(self):
+        return self.client.login_url()
 
-        return self.kite.orders()
+    # =========================================================
+    # AUTH CHECK
+    # =========================================================
 
-    # -------------------------------------------------------------
+    def authenticated(self) -> bool:
 
-    def trades(self):
+        return bool(
+            self.client is not None
+            and self.access_token
+        )
 
-        return self.kite.trades()
+    def profile(self) -> dict[str, Any]:
 
-    # -------------------------------------------------------------
+        self._require_client()
 
-    def instruments(self, exchange=None):
+        return self.client.profile()
 
-        return self.kite.instruments(exchange)
+    # =========================================================
+    # SAFE CLIENT
+    # =========================================================
 
-    # -------------------------------------------------------------
+    def _require_client(self):
 
-    def ltp(self, instruments):
+        if self.client is None:
 
-        return self.kite.ltp(instruments)
+            raise RuntimeError(
+                "Kite client is not initialized. "
+                "Configure api_key and access_token."
+            )
 
-    # -------------------------------------------------------------
+        if not self.access_token:
 
-    def quote(self, instruments):
+            raise RuntimeError(
+                "Kite access token is not configured."
+            )
 
-        return self.kite.quote(instruments)
+        return self.client
 
-    # -------------------------------------------------------------
+    # =========================================================
+    # RETRY
+    # =========================================================
+
+    def _execute(
+        self,
+        method: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+
+        last_error = None
+
+        for attempt in range(
+            self.RETRIES
+        ):
+
+            try:
+
+                return method(
+                    *args,
+                    **kwargs,
+                )
+
+            except Exception as exc:
+
+                last_error = exc
+
+                if attempt >= self.RETRIES - 1:
+                    break
+
+                delay = (
+                    self.RETRY_DELAY
+                    * (2 ** attempt)
+                )
+
+                logger.warning(
+                    "Kite request failed "
+                    "(%s/%s): %s",
+                    attempt + 1,
+                    self.RETRIES,
+                    exc,
+                )
+
+                time.sleep(delay)
+
+        raise last_error
+
+    # =========================================================
+    # HISTORICAL DATA
+    # =========================================================
 
     def historical_data(
-            self,
+        self,
+        instrument_token: int | str,
+        from_date: Any,
+        to_date: Any,
+        interval: str = "day",
+        continuous: bool = False,
+        oi: bool = False,
+    ) -> pd.DataFrame:
+
+        client = self._require_client()
+
+        records = self._execute(
+            client.historical_data,
             instrument_token,
             from_date,
             to_date,
             interval,
-            continuous=False,
-            oi=False
-    ):
+            continuous=continuous,
+            oi=oi,
+        )
 
-        return self.kite.historical_data(
+        return self._normalize_candles(
+            records
+        )
+
+    def candles(
+        self,
+        instrument_token: int | str,
+        days: int = 365,
+        interval: str = "day",
+        oi: bool = False,
+    ) -> pd.DataFrame:
+
+        to_date = datetime.now()
+
+        from_date = (
+            to_date
+            - timedelta(days=days)
+        )
+
+        return self.historical_data(
             instrument_token=instrument_token,
             from_date=from_date,
             to_date=to_date,
             interval=interval,
-            continuous=continuous,
-            oi=oi
+            oi=oi,
         )
 
-    # -------------------------------------------------------------
+    # =========================================================
+    # SYMBOL CANDLES
+    # =========================================================
 
-    def place_order(
-            self,
-            exchange,
-            tradingsymbol,
-            transaction_type,
-            quantity,
-            order_type,
-            product,
-            variety="regular",
-            price=None,
-            trigger_price=None,
-            validity="DAY",
-            disclosed_quantity=None,
-            tag=None
-    ):
+    def symbol_candles(
+        self,
+        instrument_token: int | str,
+        period: str = "1y",
+        interval: str = "day",
+        oi: bool = False,
+    ) -> pd.DataFrame:
 
-        return self.kite.place_order(
-            variety=variety,
-            exchange=exchange,
-            tradingsymbol=tradingsymbol,
-            transaction_type=transaction_type,
-            quantity=quantity,
-            order_type=order_type,
-            product=product,
-            price=price,
-            trigger_price=trigger_price,
-            validity=validity,
-            disclosed_quantity=disclosed_quantity,
-            tag=tag
+        days_map = {
+            "1d": 2,
+            "5d": 7,
+            "1mo": 31,
+            "3mo": 100,
+            "6mo": 190,
+            "1y": 370,
+            "2y": 740,
+            "5y": 1850,
+        }
+
+        days = days_map.get(
+            period,
+            365,
         )
 
-    # -------------------------------------------------------------
+        return self.candles(
+            instrument_token=instrument_token,
+            days=days,
+            interval=interval,
+            oi=oi,
+        )
 
-    def modify_order(
-            self,
-            variety,
+    # =========================================================
+    # NORMALIZATION
+    # =========================================================
+
+    @staticmethod
+    def _normalize_candles(
+        records: Any,
+    ) -> pd.DataFrame:
+
+        if records is None:
+
+            return pd.DataFrame(
+                columns=[
+                    "date",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                ]
+            )
+
+        df = pd.DataFrame(
+            records
+        )
+
+        if df.empty:
+            return df
+
+        rename_map = {
+            "timestamp": "date",
+            "oi": "open_interest",
+        }
+
+        df.rename(
+            columns=rename_map,
+            inplace=True,
+        )
+
+        if "date" in df.columns:
+
+            df["date"] = pd.to_datetime(
+                df["date"],
+                errors="coerce",
+            )
+
+        numeric_columns = [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "open_interest",
+        ]
+
+        for column in numeric_columns:
+
+            if column in df.columns:
+
+                df[column] = pd.to_numeric(
+                    df[column],
+                    errors="coerce",
+                )
+
+        required = [
+            "open",
+            "high",
+            "low",
+            "close",
+        ]
+
+        existing = [
+            column
+            for column in required
+            if column in df.columns
+        ]
+
+        if existing:
+
+            df = df.dropna(
+                subset=existing
+            )
+
+        if "date" in df.columns:
+
+            df = df.sort_values(
+                "date"
+            )
+
+            df = df.drop_duplicates(
+                subset=["date"],
+                keep="last",
+            )
+
+        df.reset_index(
+            drop=True,
+            inplace=True,
+        )
+
+        return df
+
+    # =========================================================
+    # LTP
+    # =========================================================
+
+    def ltp(
+        self,
+        instruments: str | Iterable[str],
+    ) -> dict[str, Any]:
+
+        client = self._require_client()
+
+        if isinstance(
+            instruments,
+            str,
+        ):
+            instruments = [
+                instruments
+            ]
+
+        return self._execute(
+            client.ltp,
+            list(instruments),
+        )
+
+    # =========================================================
+    # QUOTE
+    # =========================================================
+
+    def quote(
+        self,
+        instruments: str | Iterable[str],
+    ) -> dict[str, Any]:
+
+        client = self._require_client()
+
+        if isinstance(
+            instruments,
+            str,
+        ):
+            instruments = [
+                instruments
+            ]
+
+        return self._execute(
+            client.quote,
+            list(instruments),
+        )
+
+    # =========================================================
+    # OHLC
+    # =========================================================
+
+    def ohlc(
+        self,
+        instruments: str | Iterable[str],
+    ) -> dict[str, Any]:
+
+        client = self._require_client()
+
+        if isinstance(
+            instruments,
+            str,
+        ):
+            instruments = [
+                instruments
+            ]
+
+        return self._execute(
+            client.ohlc,
+            list(instruments),
+        )
+
+    # =========================================================
+    # INSTRUMENTS
+    # =========================================================
+
+    def instruments(
+        self,
+        exchange: str | None = None,
+    ) -> list[dict[str, Any]]:
+
+        client = self._require_client()
+
+        if exchange:
+
+            return self._execute(
+                client.instruments,
+                exchange,
+            )
+
+        return self._execute(
+            client.instruments
+        )
+
+    def instruments_dataframe(
+        self,
+        exchange: str | None = None,
+    ) -> pd.DataFrame:
+
+        return pd.DataFrame(
+            self.instruments(
+                exchange
+            )
+        )
+
+    # =========================================================
+    # ORDERS
+    # =========================================================
+
+    def orders(self) -> list[dict[str, Any]]:
+
+        client = self._require_client()
+
+        return self._execute(
+            client.orders
+        )
+
+    def order_history(
+        self,
+        order_id: str,
+    ) -> list[dict[str, Any]]:
+
+        client = self._require_client()
+
+        return self._execute(
+            client.order_history,
             order_id,
-            **kwargs
-    ):
-
-        return self.kite.modify_order(
-            variety=variety,
-            order_id=order_id,
-            **kwargs
         )
 
-    # -------------------------------------------------------------
+    # =========================================================
+    # POSITIONS
+    # =========================================================
 
-    def cancel_order(
-            self,
-            variety,
-            order_id
-    ):
+    def positions(self) -> dict[str, Any]:
 
-        return self.kite.cancel_order(
-            variety=variety,
-            order_id=order_id
+        client = self._require_client()
+
+        return self._execute(
+            client.positions
         )
 
-    # -------------------------------------------------------------
+    # =========================================================
+    # HOLDINGS
+    # =========================================================
 
-    def order_history(self, order_id):
+    def holdings(self) -> list[dict[str, Any]]:
 
-        return self.kite.order_history(order_id)
+        client = self._require_client()
 
-    # -------------------------------------------------------------
+        return self._execute(
+            client.holdings
+        )
 
-    def order_trades(self, order_id):
+    # =========================================================
+    # MARGINS
+    # =========================================================
 
-        return self.kite.order_trades(order_id)
+    def margins(self) -> dict[str, Any]:
 
-    # -------------------------------------------------------------
+        client = self._require_client()
 
-    def get_gtts(self):
+        return self._execute(
+            client.margins
+        )
 
-        return self.kite.get_gtts()
+    # =========================================================
+    # TRADES
+    # =========================================================
 
-    # -------------------------------------------------------------
+    def trades(self) -> list[dict[str, Any]]:
 
-    def invalidate_session(self):
+        client = self._require_client()
+
+        return self._execute(
+            client.trades
+        )
+
+    # =========================================================
+    # MARKET DEPTH
+    # =========================================================
+
+    def market_depth(
+        self,
+        instrument: str,
+    ) -> dict[str, Any]:
+
+        return self.quote(
+            instrument
+        )
+
+    # =========================================================
+    # HEALTH
+    # =========================================================
+
+    def health(self) -> dict[str, Any]:
+
+        return {
+            "provider": "kite",
+            "version": self.VERSION,
+            "installed": KiteConnect is not None,
+            "configured": self.client is not None,
+            "authenticated": self.authenticated(),
+        }
+
+    def ping(self) -> bool:
+
+        if not self.authenticated():
+            return False
 
         try:
 
-            self.kite.invalidate_access_token()
+            self.profile()
 
-            self.access_token = None
+            return True
 
-            logger.info("Kite session invalidated.")
+        except Exception:
 
-        except Exception as e:
+            logger.exception(
+                "Kite ping failed"
+            )
 
-            logger.exception(e)
+            return False
 
-    # -------------------------------------------------------------
 
-    def retry(func):
-
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-
-            retries = 3
-
-            delay = 1
-
-            for attempt in range(retries):
-
-                try:
-
-                    return func(*args, **kwargs)
-
-                except KiteException as e:
-
-                    logger.warning(
-                        "Kite Exception (%s): %s",
-                        attempt + 1,
-                        e
-                    )
-
-                    if attempt == retries - 1:
-                        raise
-
-                    time.sleep(delay)
-
-                    delay *= 2
-
-                except Exception:
-
-                    raise
-
-        return wrapper
-
-    # -------------------------------------------------------------
-
-    @retry
-    def safe_quote(self, instruments):
-
-        return self.quote(instruments)
-
-    # -------------------------------------------------------------
-
-    @retry
-    def safe_ltp(self, instruments):
-
-        return self.ltp(instruments)
-
-    # -------------------------------------------------------------
-
-    @retry
-    def safe_historical(
-            self,
-            instrument_token,
-            from_date,
-            to_date,
-            interval,
-            continuous=False,
-            oi=False
-    ):
-
-        return self.historical_data(
-            instrument_token,
-            from_date,
-            to_date,
-            interval,
-            continuous,
-            oi
-        )
-
+# =============================================================
+# SINGLETON
+# =============================================================
 
 kite_provider = KiteProvider()
 
-class KiteProvider(ABC):
 
-    def __init__(self, kite):
+# =============================================================
+# FACTORY
+# =============================================================
 
-        self.kite = kite
+def get_kite_provider(
+    api_key: str | None = None,
+    access_token: str | None = None,
+) -> KiteProvider:
 
-    def historical_data(
+    if api_key or access_token:
 
-        self,
-
-        instrument_token,
-
-        from_date,
-
-        to_date,
-
-        interval,
-
-    ):
-
-        data = self.kite.historical_data(
-
-            instrument_token,
-
-            from_date,
-
-            to_date,
-
-            interval,
-
-            oi=True,
-
+        kite_provider.configure(
+            api_key=api_key or kite_provider.api_key,
+            access_token=access_token
+            or kite_provider.access_token,
         )
 
-        return pd.DataFrame(data)
-
-    def ltp(self, instruments):
-
-        return self.kite.ltp(instruments)
-
-    def quote(self, instruments):
-
-        return self.kite.quote(instruments)
+    return kite_provider
