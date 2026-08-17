@@ -1,34 +1,19 @@
 """
-providers/yfinance_provider.py
-================================
+TrendForge v2
+Yahoo Finance Provider
 
-Yahoo Finance provider for TrendForge.
+Fallback market-data provider.
 
-Purpose
--------
-Provides market data when:
-- Kite is unavailable
-- NSE endpoints fail
-- Historical data beyond broker limits is needed
-- Global indices are required
-
-Features
---------
-✓ Historical OHLCV
-✓ Live quote
-✓ Company info
-✓ Financials
-✓ Balance Sheet
-✓ Cash Flow
-✓ Earnings
-✓ Dividends
-✓ Splits
-✓ Recommendations
-✓ Option Chain
-✓ Multiple ticker download
-✓ Retry
-✓ In-memory cache
-✓ Thread-safe singleton
+Used for:
+- Historical OHLCV
+- Intraday data
+- Live prices
+- Index data
+- Fundamental data
+- Options
+- Institutional ownership
+- Mutual-fund ownership
+- News
 """
 
 from __future__ import annotations
@@ -36,21 +21,29 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from functools import wraps
-from typing import Dict, List, Optional, Any
+from typing import Any, Iterable
 
 import pandas as pd
 import yfinance as yf
+
 
 logger = logging.getLogger(__name__)
 
 
 class YahooFinanceProvider:
 
+    VERSION = "2.1"
+
+    CACHE_TTL = 60
+    RETRIES = 3
+    RETRY_DELAY = 1.0
+
     _instance = None
     _lock = threading.Lock()
 
-    CACHE_TTL = 60
+    # =========================================================
+    # SINGLETON
+    # =========================================================
 
     def __new__(cls):
 
@@ -59,401 +52,739 @@ class YahooFinanceProvider:
             with cls._lock:
 
                 if cls._instance is None:
-                    cls._instance = super().__new__(cls)
+
+                    cls._instance = (
+                        super().__new__(cls)
+                    )
 
         return cls._instance
 
     def __init__(self):
 
-        if hasattr(self, "_initialized"):
+        if getattr(
+            self,
+            "_initialized",
+            False,
+        ):
             return
 
-        self.cache = {}
+        self.cache: dict[
+            Any,
+            tuple[Any, float],
+        ] = {}
 
         self._initialized = True
 
-    ####################################################################
-    # Cache
-    ####################################################################
+    # =========================================================
+    # CACHE
+    # =========================================================
 
-    def _cache_get(self, key):
+    def _cache_get(
+        self,
+        key: Any,
+    ) -> Any:
 
-        if key not in self.cache:
+        item = self.cache.get(
+            key
+        )
+
+        if item is None:
             return None
 
-        value, ts = self.cache[key]
+        value, timestamp = item
 
-        if time.time() - ts > self.CACHE_TTL:
-            del self.cache[key]
+        if (
+            time.time()
+            - timestamp
+            > self.CACHE_TTL
+        ):
+
+            self.cache.pop(
+                key,
+                None,
+            )
+
             return None
 
         return value
 
-    def _cache_set(self, key, value):
+    def _cache_set(
+        self,
+        key: Any,
+        value: Any,
+    ) -> None:
 
         self.cache[key] = (
             value,
-            time.time()
+            time.time(),
         )
 
-    ####################################################################
-    # Retry
-    ####################################################################
+    def clear_cache(self) -> None:
 
-    @staticmethod
-    def retry(func):
+        self.cache.clear()
 
-        @wraps(func)
-        def wrapper(*args, **kwargs):
+    # =========================================================
+    # RETRY
+    # =========================================================
 
-            retries = 3
-            delay = 1
+    def _execute(
+        self,
+        method,
+        *args,
+        **kwargs,
+    ):
 
-            for attempt in range(retries):
+        last_error = None
 
-                try:
-                    return func(*args, **kwargs)
+        for attempt in range(
+            self.RETRIES
+        ):
 
-                except Exception as e:
+            try:
 
-                    logger.warning(
-                        "%s failed (%s/3): %s",
-                        func.__name__,
-                        attempt + 1,
-                        e
+                return method(
+                    *args,
+                    **kwargs,
+                )
+
+            except Exception as exc:
+
+                last_error = exc
+
+                logger.warning(
+                    "YFinance request failed "
+                    "(%s/%s): %s",
+                    attempt + 1,
+                    self.RETRIES,
+                    exc,
+                )
+
+                if (
+                    attempt
+                    < self.RETRIES - 1
+                ):
+
+                    time.sleep(
+                        self.RETRY_DELAY
+                        * (2 ** attempt)
                     )
 
-                    time.sleep(delay)
+        raise RuntimeError(
+            f"YFinance request failed: "
+            f"{last_error}"
+        )
 
-                    delay *= 2
+    # =========================================================
+    # SYMBOL NORMALIZATION
+    # =========================================================
 
-            raise Exception(
-                f"{func.__name__} failed after retries."
+    @staticmethod
+    def normalize_symbol(
+        symbol: str,
+    ) -> str:
+
+        symbol = str(
+            symbol
+        ).strip().upper()
+
+        if (
+            symbol.endswith(".NS")
+            or symbol.endswith(".BO")
+            or symbol.startswith("^")
+        ):
+            return symbol
+
+        return (
+            f"{symbol}.NS"
+        )
+
+    def ticker(
+        self,
+        symbol: str,
+    ):
+
+        return yf.Ticker(
+            self.normalize_symbol(
+                symbol
             )
+        )
 
-        return wrapper
+    # =========================================================
+    # HISTORICAL DATA
+    # =========================================================
 
-    ####################################################################
-    # Internal
-    ####################################################################
-
-    def ticker(self, symbol: str):
-
-        if not symbol.endswith(".NS") and not symbol.endswith(".BO"):
-            symbol = f"{symbol}.NS"
-
-        return yf.Ticker(symbol)
-
-    ####################################################################
-    # Historical Data
-    ####################################################################
-
-    @retry
     def historical_data(
-            self,
-            symbol: str,
-            period="1y",
-            interval="1d",
-            auto_adjust=True
+        self,
+        symbol: str,
+        period: str = "1y",
+        interval: str = "1d",
+        auto_adjust: bool = False,
     ) -> pd.DataFrame:
 
         key = (
             "history",
             symbol,
             period,
-            interval
+            interval,
+            auto_adjust,
         )
 
-        cached = self._cache_get(key)
+        cached = self._cache_get(
+            key
+        )
 
         if cached is not None:
             return cached
 
-        df = self.ticker(symbol).history(
-            period=period,
-            interval=interval,
-            auto_adjust=auto_adjust
+        ticker = self.ticker(
+            symbol
         )
 
-        self._cache_set(key, df)
+        df = self._execute(
+            ticker.history,
+            period=period,
+            interval=interval,
+            auto_adjust=auto_adjust,
+        )
+
+        df = self.normalize_ohlcv(
+            df
+        )
+
+        self._cache_set(
+            key,
+            df
+        )
 
         return df
 
-    ####################################################################
-    # Download Multiple
-    ####################################################################
+    # =========================================================
+    # CANDLES
+    # =========================================================
 
-    @retry
-    def download(
-            self,
-            symbols: List[str],
-            period="6mo",
-            interval="1d"
+    def candles(
+        self,
+        symbol: str,
+        period: str = "6mo",
+        interval: str = "1d",
     ) -> pd.DataFrame:
 
-        symbols = [
-            s if s.endswith(".NS") else s + ".NS"
-            for s in symbols
+        return self.historical_data(
+            symbol=symbol,
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+        )
+
+    # =========================================================
+    # OHLCV NORMALIZATION
+    # =========================================================
+
+    @staticmethod
+    def normalize_ohlcv(
+        df: pd.DataFrame,
+    ) -> pd.DataFrame:
+
+        if df is None:
+            return pd.DataFrame()
+
+        if df.empty:
+            return df
+
+        result = df.copy()
+
+        # Flatten MultiIndex columns.
+
+        if isinstance(
+            result.columns,
+            pd.MultiIndex,
+        ):
+
+            result.columns = [
+                str(column[0])
+                for column in result.columns
+            ]
+
+        rename_map = {
+            "Open": "open",
+            "High": "high",
+            "Low": "low",
+            "Close": "close",
+            "Adj Close": "adj_close",
+            "Volume": "volume",
+        }
+
+        result.rename(
+            columns=rename_map,
+            inplace=True,
+        )
+
+        if (
+            isinstance(
+                result.index,
+                pd.DatetimeIndex,
+            )
+        ):
+
+            result = result.reset_index()
+
+            if "Datetime" in result.columns:
+
+                result.rename(
+                    columns={
+                        "Datetime": "date"
+                    },
+                    inplace=True,
+                )
+
+            elif "Date" in result.columns:
+
+                result.rename(
+                    columns={
+                        "Date": "date"
+                    },
+                    inplace=True,
+                )
+
+        numeric_columns = [
+            "open",
+            "high",
+            "low",
+            "close",
+            "adj_close",
+            "volume",
         ]
 
-        return yf.download(
-            symbols,
+        for column in numeric_columns:
+
+            if column in result.columns:
+
+                result[column] = pd.to_numeric(
+                    result[column],
+                    errors="coerce",
+                )
+
+        if "date" in result.columns:
+
+            result["date"] = pd.to_datetime(
+                result["date"],
+                errors="coerce",
+            )
+
+            result.sort_values(
+                "date",
+                inplace=True,
+            )
+
+        result.reset_index(
+            drop=True,
+            inplace=True,
+        )
+
+        return result
+
+    # =========================================================
+    # DOWNLOAD MULTIPLE
+    # =========================================================
+
+    def download(
+        self,
+        symbols: Iterable[str],
+        period: str = "6mo",
+        interval: str = "1d",
+    ) -> pd.DataFrame:
+
+        normalized = [
+            self.normalize_symbol(
+                symbol
+            )
+            for symbol in symbols
+        ]
+
+        return self._execute(
+            yf.download,
+            normalized,
             period=period,
             interval=interval,
             group_by="ticker",
             threads=True,
-            progress=False
+            progress=False,
+            auto_adjust=False,
         )
 
-    ####################################################################
-    # Live Quote
-    ####################################################################
+    # =========================================================
+    # LIVE PRICE
+    # =========================================================
 
-    @retry
-    def live_price(self, symbol):
+    def live_price(
+        self,
+        symbol: str,
+    ) -> dict[str, Any]:
 
-        data = self.ticker(symbol).fast_info
+        ticker = self.ticker(
+            symbol
+        )
+
+        info = self._execute(
+            lambda: ticker.fast_info
+        )
 
         return {
-            "symbol": symbol,
-            "last_price": data.get("lastPrice"),
-            "open": data.get("open"),
-            "high": data.get("dayHigh"),
-            "low": data.get("dayLow"),
-            "volume": data.get("lastVolume")
+            "symbol": symbol.upper(),
+            "last_price": info.get(
+                "lastPrice"
+            ),
+            "open": info.get(
+                "open"
+            ),
+            "high": info.get(
+                "dayHigh"
+            ),
+            "low": info.get(
+                "dayLow"
+            ),
+            "volume": info.get(
+                "lastVolume"
+            ),
         }
 
-    ####################################################################
-    # Company Information
-    ####################################################################
+    # =========================================================
+    # COMPANY INFO
+    # =========================================================
 
-    @retry
-    def company_info(self, symbol):
-
-        return self.ticker(symbol).info
-
-    ####################################################################
-    # Financial Statements
-    ####################################################################
-
-    @retry
-    def financials(self, symbol):
-
-        return self.ticker(symbol).financials
-
-    @retry
-    def quarterly_financials(self, symbol):
-
-        return self.ticker(symbol).quarterly_financials
-
-    ####################################################################
-    # Balance Sheet
-    ####################################################################
-
-    @retry
-    def balance_sheet(self, symbol):
-
-        return self.ticker(symbol).balance_sheet
-
-    @retry
-    def quarterly_balance_sheet(self, symbol):
-
-        return self.ticker(symbol).quarterly_balance_sheet
-
-    ####################################################################
-    # Cash Flow
-    ####################################################################
-
-    @retry
-    def cashflow(self, symbol):
-
-        return self.ticker(symbol).cashflow
-
-    @retry
-    def quarterly_cashflow(self, symbol):
-
-        return self.ticker(symbol).quarterly_cashflow
-
-    ####################################################################
-    # Earnings
-    ####################################################################
-
-    @retry
-    def earnings(self, symbol):
-
-        return self.ticker(symbol).earnings
-
-    @retry
-    def quarterly_earnings(self, symbol):
-
-        return self.ticker(symbol).quarterly_earnings
-
-    ####################################################################
-    # Dividends
-    ####################################################################
-
-    @retry
-    def dividends(self, symbol):
-
-        return self.ticker(symbol).dividends
-
-    ####################################################################
-    # Splits
-    ####################################################################
-
-    @retry
-    def splits(self, symbol):
-
-        return self.ticker(symbol).splits
-
-    ####################################################################
-    # Insider Transactions
-    ####################################################################
-
-    @retry
-    def insider_transactions(self, symbol):
-
-        return self.ticker(symbol).insider_transactions
-
-    ####################################################################
-    # Recommendations
-    ####################################################################
-
-    @retry
-    def recommendations(self, symbol):
-
-        return self.ticker(symbol).recommendations
-
-    ####################################################################
-    # Sustainability
-    ####################################################################
-
-    @retry
-    def sustainability(self, symbol):
-
-        return self.ticker(symbol).sustainability
-
-    ####################################################################
-    # Option Chain
-    ####################################################################
-
-    @retry
-    def option_expiries(self, symbol):
-
-        return self.ticker(symbol).options
-
-    @retry
-    def option_chain(
-            self,
-            symbol,
-            expiry
+    def company_info(
+        self,
+        symbol: str,
     ):
 
-        return self.ticker(symbol).option_chain(expiry)
+        return self._execute(
+            lambda: self.ticker(
+                symbol
+            ).info
+        )
 
-    ####################################################################
-    # News
-    ####################################################################
+    # =========================================================
+    # FINANCIALS
+    # =========================================================
 
-    @retry
-    def news(self, symbol):
+    def financials(
+        self,
+        symbol: str,
+    ):
+
+        return self._execute(
+            lambda: self.ticker(
+                symbol
+            ).financials
+        )
+
+    def quarterly_financials(
+        self,
+        symbol: str,
+    ):
+
+        return self._execute(
+            lambda: self.ticker(
+                symbol
+            ).quarterly_financials
+        )
+
+    # =========================================================
+    # BALANCE SHEET
+    # =========================================================
+
+    def balance_sheet(
+        self,
+        symbol: str,
+    ):
+
+        return self._execute(
+            lambda: self.ticker(
+                symbol
+            ).balance_sheet
+        )
+
+    def quarterly_balance_sheet(
+        self,
+        symbol: str,
+    ):
+
+        return self._execute(
+            lambda: self.ticker(
+                symbol
+            ).quarterly_balance_sheet
+        )
+
+    # =========================================================
+    # CASH FLOW
+    # =========================================================
+
+    def cashflow(
+        self,
+        symbol: str,
+    ):
+
+        return self._execute(
+            lambda: self.ticker(
+                symbol
+            ).cashflow
+        )
+
+    def quarterly_cashflow(
+        self,
+        symbol: str,
+    ):
+
+        return self._execute(
+            lambda: self.ticker(
+                symbol
+            ).quarterly_cashflow
+        )
+
+    # =========================================================
+    # EARNINGS
+    # =========================================================
+
+    def earnings(
+        self,
+        symbol: str,
+    ):
+
+        return self._execute(
+            lambda: self.ticker(
+                symbol
+            ).earnings
+        )
+
+    # =========================================================
+    # DIVIDENDS
+    # =========================================================
+
+    def dividends(
+        self,
+        symbol: str,
+    ):
+
+        return self._execute(
+            lambda: self.ticker(
+                symbol
+            ).dividends
+        )
+
+    # =========================================================
+    # SPLITS
+    # =========================================================
+
+    def splits(
+        self,
+        symbol: str,
+    ):
+
+        return self._execute(
+            lambda: self.ticker(
+                symbol
+            ).splits
+        )
+
+    # =========================================================
+    # INSIDER TRANSACTIONS
+    # =========================================================
+
+    def insider_transactions(
+        self,
+        symbol: str,
+    ):
+
+        return self._execute(
+            lambda: self.ticker(
+                symbol
+            ).insider_transactions
+        )
+
+    # =========================================================
+    # RECOMMENDATIONS
+    # =========================================================
+
+    def recommendations(
+        self,
+        symbol: str,
+    ):
+
+        return self._execute(
+            lambda: self.ticker(
+                symbol
+            ).recommendations
+        )
+
+    # =========================================================
+    # OPTIONS
+    # =========================================================
+
+    def option_expiries(
+        self,
+        symbol: str,
+    ):
+
+        return self._execute(
+            lambda: self.ticker(
+                symbol
+            ).options
+        )
+
+    def option_chain(
+        self,
+        symbol: str,
+        expiry: str,
+    ):
+
+        return self._execute(
+            lambda: self.ticker(
+                symbol
+            ).option_chain(
+                expiry
+            )
+        )
+
+    # =========================================================
+    # NEWS
+    # =========================================================
+
+    def news(
+        self,
+        symbol: str,
+    ):
 
         try:
-            return self.ticker(symbol).news
+
+            return self._execute(
+                lambda: self.ticker(
+                    symbol
+                ).news
+            )
+
         except Exception:
+
             return []
 
-    ####################################################################
-    # Major Holders
-    ####################################################################
+    # =========================================================
+    # HOLDERS
+    # =========================================================
 
-    @retry
-    def major_holders(self, symbol):
+    def major_holders(
+        self,
+        symbol: str,
+    ):
 
-        return self.ticker(symbol).major_holders
+        return self._execute(
+            lambda: self.ticker(
+                symbol
+            ).major_holders
+        )
 
-    ####################################################################
-    # Institutional Holders
-    ####################################################################
+    def institutional_holders(
+        self,
+        symbol: str,
+    ):
 
-    @retry
-    def institutional_holders(self, symbol):
+        return self._execute(
+            lambda: self.ticker(
+                symbol
+            ).institutional_holders
+        )
 
-        return self.ticker(symbol).institutional_holders
+    def mutualfund_holders(
+        self,
+        symbol: str,
+    ):
 
-    ####################################################################
-    # Mutual Fund Holders
-    ####################################################################
+        return self._execute(
+            lambda: self.ticker(
+                symbol
+            ).mutualfund_holders
+        )
 
-    @retry
-    def mutualfund_holders(self, symbol):
-
-        return self.ticker(symbol).mutualfund_holders
-
-    ####################################################################
-    # Convenience
-    ####################################################################
+    # =========================================================
+    # INDICES
+    # =========================================================
 
     def nifty50(self):
 
-        return self.historical_data("^NSEI")
+        return self.historical_data(
+            "^NSEI"
+        )
 
     def banknifty(self):
 
-        return self.historical_data("^NSEBANK")
+        return self.historical_data(
+            "^NSEBANK"
+        )
 
     def sensex(self):
 
-        return self.historical_data("^BSESN")
+        return self.historical_data(
+            "^BSESN"
+        )
 
     def india_vix(self):
 
-        return self.historical_data("^INDIAVIX")
+        return self.historical_data(
+            "^INDIAVIX"
+        )
 
-    ####################################################################
-    # Health Check
-    ####################################################################
+    # =========================================================
+    # HEALTH
+    # =========================================================
 
-    def ping(self):
+    def health(
+        self,
+    ) -> dict[str, Any]:
+
+        return {
+            "provider": "yfinance",
+            "version": self.VERSION,
+            "installed": True,
+        }
+
+    def ping(
+        self,
+    ) -> bool:
 
         try:
 
-            self.live_price("RELIANCE")
+            data = self.live_price(
+                "RELIANCE"
+            )
 
-            return True
+            return (
+                data.get(
+                    "last_price"
+                )
+                is not None
+            )
 
         except Exception:
+
+            logger.exception(
+                "YFinance ping failed"
+            )
 
             return False
 
 
-# Singleton instance
-yfinance_provider = YahooFinanceProvider()
+# =============================================================
+# SINGLETON
+# =============================================================
 
-class YahooFinanceProvider:
+yfinance_provider = (
+    YahooFinanceProvider()
+)
 
-    def candles(
 
-        self,
+# =============================================================
+# FACTORY
+# =============================================================
 
-        symbol,
+def get_yfinance_provider(
+) -> YahooFinanceProvider:
 
-        period="6mo",
-
-        interval="1d",
-
-    ):
-
-        return yf.download(
-
-            symbol,
-
-            period=period,
-
-            interval=interval,
-
-            progress=False,
-
-            auto_adjust=False,
-
-        )
+    return yfinance_provider
